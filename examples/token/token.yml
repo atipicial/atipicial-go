@@ -1,0 +1,15 @@
+name: "Awesome ATC Token"
+sourceurl: https://github.com/atipicial/atipicial-go/
+supportedstandards: ["AEP-17"]
+safemethods: ["balanceOf", "decimals", "symbol", "totalSupply"]
+events:
+  - name: Transfer
+    parameters:
+      - name: from
+        type: Hash160
+      - name: to
+        type: Hash160
+      - name: amount
+        type: Integer
+permissions:
+  - methods: ["onAEP17Payment"]

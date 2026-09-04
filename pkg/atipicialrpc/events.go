@@ -1,0 +1,113 @@
+package atipicialrpc
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+// EventID represents an event type happening on the chain.
+type EventID byte
+
+const (
+	// InvalidEventID is an invalid event id that is the default value of
+	// EventID. It's only used as an initial value similar to nil.
+	InvalidEventID EventID = iota
+	// BlockEventID is a `block_added` event.
+	BlockEventID
+	// TransactionEventID corresponds to the `transaction_added` event.
+	TransactionEventID
+	// NotificationEventID represents `notification_from_execution` events.
+	NotificationEventID
+	// ExecutionEventID is used for `transaction_executed` events.
+	ExecutionEventID
+	// NotaryRequestEventID is used for the `notary_request_event` event.
+	NotaryRequestEventID
+	// HeaderOfAddedBlockEventID is used for the `header_of_added_block` event.
+	HeaderOfAddedBlockEventID
+	// MempoolEventID is used for the `mempool_event` event.
+	MempoolEventID
+	// lastEventID denotes the end of EventID enum. Consider adding new event
+	// IDs before lastEventID.
+	lastEventID
+	// MissedEventID notifies user of missed events.
+	MissedEventID EventID = 255
+)
+
+// EventIDs holds the list of all event IDs except the InvalidEventID and
+// MissedEventID.
+var EventIDs []EventID
+
+func init() {
+	for i := BlockEventID; i < lastEventID; i++ {
+		EventIDs = append(EventIDs, i)
+	}
+}
+
+// String is a good old Stringer implementation.
+func (e EventID) String() string {
+	switch e {
+	case BlockEventID:
+		return "block_added"
+	case TransactionEventID:
+		return "transaction_added"
+	case NotificationEventID:
+		return "notification_from_execution"
+	case ExecutionEventID:
+		return "transaction_executed"
+	case NotaryRequestEventID:
+		return "notary_request_event"
+	case HeaderOfAddedBlockEventID:
+		return "header_of_added_block"
+	case MissedEventID:
+		return "event_missed"
+	case MempoolEventID:
+		return "mempool_event"
+	default:
+		return "unknown"
+	}
+}
+
+// GetEventIDFromString converts an input string into an EventID if it's possible.
+func GetEventIDFromString(s string) (EventID, error) {
+	switch s {
+	case "block_added":
+		return BlockEventID, nil
+	case "transaction_added":
+		return TransactionEventID, nil
+	case "notification_from_execution":
+		return NotificationEventID, nil
+	case "transaction_executed":
+		return ExecutionEventID, nil
+	case "notary_request_event":
+		return NotaryRequestEventID, nil
+	case "header_of_added_block":
+		return HeaderOfAddedBlockEventID, nil
+	case "event_missed":
+		return MissedEventID, nil
+	case "mempool_event":
+		return MempoolEventID, nil
+	default:
+		return 255, fmt.Errorf("invalid stream name: %s", s)
+	}
+}
+
+// MarshalJSON implements the json.Marshaler interface.
+func (e EventID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(e.String())
+}
+
+// UnmarshalJSON implements the json.Unmarshaler interface.
+func (e *EventID) UnmarshalJSON(b []byte) error {
+	var s string
+
+	err := json.Unmarshal(b, &s)
+	if err != nil {
+		return err
+	}
+	id, err := GetEventIDFromString(s)
+	if err != nil {
+		return err
+	}
+	*e = id
+	return nil
+}

@@ -1,0 +1,7 @@
+name: "Storage example"
+sourceurl: https://github.com/atipicial/atipicial-go/
+supportedstandards: []
+events: []
+overloads:
+  getDefault: get
+  putDefault: put

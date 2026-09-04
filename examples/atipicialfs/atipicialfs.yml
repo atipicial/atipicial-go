@@ -1,0 +1,6 @@
+name: "AtipicialFs integration example"
+sourceurl: https://github.com/atipicial/atipicial-go/
+supportedstandards: []
+events: []
+permissions:
+  - methods: ["request"]

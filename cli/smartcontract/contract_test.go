@@ -1,0 +1,1452 @@
+package smartcontract_test
+
+import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/atipicial/atipicial-go/cli/smartcontract"
+	"github.com/atipicial/atipicial-go/internal/random"
+	"github.com/atipicial/atipicial-go/internal/testchain"
+	"github.com/atipicial/atipicial-go/internal/testcli"
+	"github.com/atipicial/atipicial-go/internal/versionutil"
+	"github.com/atipicial/atipicial-go/pkg/config"
+	"github.com/atipicial/atipicial-go/pkg/core/interop/storage"
+	"github.com/atipicial/atipicial-go/pkg/core/native/nativenames"
+	"github.com/atipicial/atipicial-go/pkg/core/state"
+	"github.com/atipicial/atipicial-go/pkg/core/transaction"
+	"github.com/atipicial/atipicial-go/pkg/crypto/keys"
+	"github.com/atipicial/atipicial-go/pkg/encoding/address"
+	"github.com/atipicial/atipicial-go/pkg/encoding/fixedn"
+	"github.com/atipicial/atipicial-go/pkg/atipicialrpc/result"
+	"github.com/atipicial/atipicial-go/pkg/smartcontract/manifest"
+	"github.com/atipicial/atipicial-go/pkg/smartcontract/aef"
+	"github.com/atipicial/atipicial-go/pkg/smartcontract/trigger"
+	"github.com/atipicial/atipicial-go/pkg/util"
+	"github.com/atipicial/atipicial-go/pkg/vm/stackitem"
+	"github.com/atipicial/atipicial-go/pkg/vm/vmstate"
+	"github.com/atipicial/atipicial-go/pkg/wallet"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
+)
+
+// Keep contract AEFs consistent between runs.
+const _ = versionutil.TestVersion
+
+func TestCalcHash(t *testing.T) {
+	tmpDir := t.TempDir()
+	e := testcli.NewExecutor(t, false)
+
+	aefPath := "./testdata/verify.aef"
+	src, err := os.ReadFile(aefPath)
+	require.NoError(t, err)
+	aefF, err := aef.FileFromBytes(src)
+	require.NoError(t, err)
+	manifestPath := "./testdata/verify.manifest.json"
+	manifestBytes, err := os.ReadFile(manifestPath)
+	require.NoError(t, err)
+	manif := &manifest.Manifest{}
+	err = json.Unmarshal(manifestBytes, manif)
+	require.NoError(t, err)
+	sender := random.Uint160()
+
+	cmd := []string{"atipicial-go", "contract", "calc-hash"}
+	t.Run("no sender", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `Required flag "sender" not set`, append(cmd, "--in", aefPath, "--manifest", manifestPath)...)
+	})
+	t.Run("no aef file", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `Required flag "in" not set`, append(cmd, "--sender", sender.StringLE(), "--manifest", manifestPath)...)
+	})
+	t.Run("no manifest file", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `Required flag "manifest" not set`, append(cmd, "--sender", sender.StringLE(), "--in", aefPath)...)
+	})
+	t.Run("invalid aef path", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "--sender", sender.StringLE(),
+			"--in", "./testdata/verify.aef123", "--manifest", manifestPath)...)
+	})
+	t.Run("invalid manifest path", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "--sender", sender.StringLE(),
+			"--in", aefPath, "--manifest", "./testdata/verify.manifest123")...)
+	})
+	t.Run("invalid aef file", func(t *testing.T) {
+		p := filepath.Join(tmpDir, "atipicialgo.calchash.verify.aef")
+		require.NoError(t, os.WriteFile(p, src[:4], os.ModePerm))
+		e.RunWithError(t, append(cmd, "--sender", sender.StringLE(), "--in", p, "--manifest", manifestPath)...)
+	})
+	t.Run("invalid manifest file", func(t *testing.T) {
+		p := filepath.Join(tmpDir, "atipicialgo.calchash.verify.manifest.json")
+		require.NoError(t, os.WriteFile(p, manifestBytes[:4], os.ModePerm))
+		e.RunWithError(t, append(cmd, "--sender", sender.StringLE(), "--in", aefPath, "--manifest", p)...)
+	})
+
+	cmd = append(cmd, "--in", aefPath, "--manifest", manifestPath)
+	expected := state.CreateContractHash(sender, aefF.Checksum, manif.Name)
+	t.Run("excessive parameters", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "--sender", sender.StringLE(), "something")...)
+	})
+	t.Run("valid, uint160", func(t *testing.T) {
+		e.Run(t, append(cmd, "--sender", sender.StringLE())...)
+		e.CheckNextLine(t, expected.StringLE())
+	})
+	t.Run("valid, uint160 with 0x", func(t *testing.T) {
+		e.Run(t, append(cmd, "--sender", "0x"+sender.StringLE())...)
+		e.CheckNextLine(t, expected.StringLE())
+	})
+	t.Run("valid, address", func(t *testing.T) {
+		e.Run(t, append(cmd, "--sender", address.Uint160ToString(sender))...)
+		e.CheckNextLine(t, expected.StringLE())
+	})
+}
+
+func TestContractBindings(t *testing.T) {
+	// For proper contract init. The actual version as it will be replaced.
+	smartcontract.ModVersion = "v0.0.0"
+
+	tmpDir := t.TempDir()
+	e := testcli.NewExecutor(t, false)
+
+	ctrPath := filepath.Join(tmpDir, "testcontract")
+	e.Run(t, "atipicial-go", "contract", "init", "--name", ctrPath)
+
+	srcPath := filepath.Join(ctrPath, "main.go")
+	require.NoError(t, os.WriteFile(srcPath, []byte(`package testcontract
+import(
+	alias "github.com/atipicial/atipicial-go/pkg/interop/native/ledger"
+)
+type MyPair struct {
+	Key int
+	Value string
+}
+func ToMap(a []MyPair) map[int]string {
+	return nil
+}
+func ToArray(m map[int]string) []MyPair {
+	return nil
+}
+func Block() *alias.Block{
+	return alias.GetBlock(1)
+}
+func Blocks() []*alias.Block {
+	return []*alias.Block{
+		alias.GetBlock(10),
+		alias.GetBlock(11),
+	}
+}
+`), os.ModePerm))
+
+	cfgPath := filepath.Join(ctrPath, "atipicial-go.yml")
+	manifestPath := filepath.Join(tmpDir, "manifest.json")
+	bindingsPath := filepath.Join(tmpDir, "bindings.yml")
+	cmd := []string{"atipicial-go", "contract", "compile"}
+
+	cmd = append(cmd, "--in", ctrPath, "--bindings", bindingsPath)
+
+	// Replace `pkg/interop` in go.mod to avoid getting an actual module version.
+	require.NoError(t, updateGoMod(ctrPath, "myimport.com/testcontract", "../../pkg/interop"))
+
+	cmd = append(cmd, "--config", cfgPath,
+		"--out", filepath.Join(tmpDir, "out.aef"),
+		"--manifest", manifestPath,
+		"--bindings", bindingsPath)
+	t.Run("excessive parameters", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "something")...)
+	})
+	e.Run(t, cmd...)
+	e.CheckEOF(t)
+	require.FileExists(t, bindingsPath)
+
+	outPath := filepath.Join(t.TempDir(), "binding.go")
+	e.Run(t, "atipicial-go", "contract", "generate-wrapper",
+		"--config", bindingsPath, "--manifest", manifestPath,
+		"--out", outPath, "--hash", "0x0123456789987654321001234567899876543210")
+
+	bs, err := os.ReadFile(outPath)
+	require.NoError(t, err)
+	require.Equal(t, `// Code generated by atipicial-go contract generate-wrapper --manifest <file.json> --out <file.go> [--hash <hash>] [--config <config>]; DO NOT EDIT.
+
+// Package testcontract contains wrappers for testcontract contract.
+package testcontract
+
+import (
+	"github.com/atipicial/atipicial-go/pkg/interop/contract"
+	"github.com/atipicial/atipicial-go/pkg/interop/native/ledger"
+	"github.com/atipicial/atipicial-go/pkg/interop/atipicialgointernal"
+	"myimport.com/testcontract"
+)
+
+// Hash contains contract hash in big-endian form.
+const Hash = "\x10\x32\x54\x76\x98\x89\x67\x45\x23\x01\x10\x32\x54\x76\x98\x89\x67\x45\x23\x01"
+
+// Block invokes `+"`block`"+` method of contract.
+func Block() *ledger.Block {
+	return atipicialgointernal.CallWithToken(Hash, "block", int(contract.All)).(*ledger.Block)
+}
+
+// Blocks invokes `+"`blocks`"+` method of contract.
+func Blocks() []*ledger.Block {
+	return atipicialgointernal.CallWithToken(Hash, "blocks", int(contract.All)).([]*ledger.Block)
+}
+
+// ToArray invokes `+"`toArray`"+` method of contract.
+func ToArray(m map[int]string) []testcontract.MyPair {
+	return atipicialgointernal.CallWithToken(Hash, "toArray", int(contract.All), m).([]testcontract.MyPair)
+}
+
+// ToMap invokes `+"`toMap`"+` method of contract.
+func ToMap(a []testcontract.MyPair) map[int]string {
+	return atipicialgointernal.CallWithToken(Hash, "toMap", int(contract.All), a).(map[int]string)
+}
+`, string(bs))
+}
+
+// updateGoMod updates the go.mod file located in the specified directory.
+// It sets the module name and replaces the atipicial-go interop package path with
+// the provided one to avoid getting an actual module version.
+func updateGoMod(dir, moduleName, atipicialGoPath string) error {
+	goModPath := filepath.Join(dir, "go.mod")
+	data, err := os.ReadFile(goModPath)
+	if err != nil {
+		return fmt.Errorf("failed to read go.mod: %w", err)
+	}
+
+	i := bytes.IndexByte(data, '\n')
+	if i == -1 {
+		return fmt.Errorf("unexpected go.mod format")
+	}
+
+	updatedData := append([]byte("module "+moduleName), data[i:]...)
+	wd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get working directory: %w", err)
+	}
+
+	replacementPath := filepath.Join(wd, atipicialGoPath)
+	updatedData = append(updatedData, "\nreplace github.com/atipicial/atipicial-go/pkg/interop => "+replacementPath+" \n"...)
+
+	if err := os.WriteFile(goModPath, updatedData, os.ModePerm); err != nil {
+		return fmt.Errorf("failed to write updated go.mod: %w", err)
+	}
+
+	return nil
+}
+
+func TestDynamicWrapper(t *testing.T) {
+	// For proper contract init. The actual version as it will be replaced.
+	smartcontract.ModVersion = "v0.0.0"
+
+	tmpDir := t.TempDir()
+	e := testcli.NewExecutor(t, true)
+
+	ctrPath := "../smartcontract/testdata"
+
+	verifyHash := testcli.DeployContract(t, e, filepath.Join(ctrPath, "verify.go"), filepath.Join(ctrPath, "verify.yml"), testcli.ValidatorWallet, testcli.ValidatorAddr, testcli.ValidatorPass)
+
+	helperContract := `package testcontract
+
+import (
+	"github.com/atipicial/atipicial-go/pkg/interop"
+	verify "myimport.com/testcontract/bindings"
+)
+
+func CallVerifyContract(h interop.Hash160) bool{
+	contractInstance := verify.NewContract(h)
+	return contractInstance.Verify()
+}`
+
+	helperDir := filepath.Join(tmpDir, "helper")
+	e.Run(t, "atipicial-go", "contract", "init", "--name", helperDir)
+
+	require.NoError(t, updateGoMod(helperDir, "myimport.com/testcontract", "../../pkg/interop"))
+	require.NoError(t, os.WriteFile(filepath.Join(helperDir, "main.go"), []byte(helperContract), os.ModePerm))
+	require.NoError(t, os.Mkdir(filepath.Join(helperDir, "bindings"), os.ModePerm))
+
+	e.Run(t, "atipicial-go", "contract", "generate-wrapper",
+		"--config", filepath.Join(ctrPath, "verify.bindings.yml"), "--manifest", filepath.Join(ctrPath, "verify.manifest.json"),
+		"--out", filepath.Join(helperDir, "bindings", "testdata.go"))
+	e.Run(t, "atipicial-go", "contract", "compile", "--in", filepath.Join(helperDir, "main.go"), "--config", filepath.Join(helperDir, "atipicial-go.yml"))
+	helperHash := testcli.DeployContract(t, e, filepath.Join(helperDir, "main.go"), filepath.Join(helperDir, "atipicial-go.yml"), testcli.ValidatorWallet, testcli.ValidatorAddr, testcli.ValidatorPass)
+
+	e.In.WriteString("one\r")
+	e.Run(t, "atipicial-go", "contract", "invokefunction",
+		"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+		"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr, "--force", "--await", helperHash.StringLE(), "callVerifyContract", verifyHash.StringLE())
+
+	tx, _ := e.CheckTxPersisted(t, "Sent invocation transaction ")
+	aer, err := e.Chain.GetAppExecResults(tx.Hash(), trigger.Application)
+	require.NoError(t, err)
+	require.Equal(t, aer[0].Stack[0].Value().(bool), true)
+}
+
+func TestContractInitAndCompile(t *testing.T) {
+	// For proper contract init. The actual version as it will be replaced.
+	smartcontract.ModVersion = "v0.0.0"
+
+	tmpDir := t.TempDir()
+	e := testcli.NewExecutor(t, false)
+
+	t.Run("no path is provided", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `Required flag "name" not set`, "atipicial-go", "contract", "init")
+	})
+	t.Run("invalid path", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "init", "--name", "\x00")
+	})
+
+	ctrPath := filepath.Join(tmpDir, "testcontract")
+	t.Run("excessive parameters", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "init", "--name", ctrPath, "something")
+	})
+
+	e.Run(t, "atipicial-go", "contract", "init", "--name", ctrPath)
+
+	t.Run("don't rewrite existing directory", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "init", "--name", ctrPath)
+	})
+
+	ctrRootPath := filepath.Join(ctrPath, "main")
+	srcPath := ctrRootPath + ".go"
+	cfgPath := filepath.Join(ctrPath, "atipicial-go.yml")
+	aefPath := filepath.Join(tmpDir, "testcontract.aef")
+	manifestPath := filepath.Join(tmpDir, "testcontract.manifest.json")
+	cmd := []string{"atipicial-go", "contract", "compile"}
+	t.Run("missing source", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `Required flag "in" not set`, cmd...)
+	})
+
+	cmd = append(cmd, "--in", srcPath, "--out", aefPath, "--manifest", manifestPath)
+	t.Run("missing config, but require manifest", func(t *testing.T) {
+		e.RunWithError(t, cmd...)
+	})
+	t.Run("provided non-existent config", func(t *testing.T) {
+		cfgName := filepath.Join(ctrPath, "notexists.yml")
+		e.RunWithError(t, append(cmd, "--config", cfgName)...)
+	})
+	t.Run("provided corrupted config", func(t *testing.T) {
+		data, err := os.ReadFile(cfgPath)
+		require.NoError(t, err)
+		badCfg := filepath.Join(tmpDir, "bad.yml")
+		require.NoError(t, os.WriteFile(badCfg, data[:len(data)-5], os.ModePerm))
+		e.RunWithError(t, append(cmd, "--config", badCfg)...)
+	})
+
+	// Replace `pkg/interop` in go.mod to avoid getting an actual module version.
+	require.NoError(t, updateGoMod(ctrPath, "myimport.com/testcontract", "../../pkg/interop"))
+
+	cmd = append(cmd, "--config", cfgPath)
+
+	t.Run("excessive parameters", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "something")...)
+	})
+
+	e.Run(t, cmd...)
+	e.CheckEOF(t)
+	require.FileExists(t, aefPath)
+	require.FileExists(t, manifestPath)
+
+	t.Run("output hex script with --verbose", func(t *testing.T) {
+		e.Run(t, append(cmd, "--verbose")...)
+		e.CheckNextLine(t, "^[0-9a-hA-H]+$")
+	})
+
+	t.Run("autocomplete outputs", func(t *testing.T) {
+		cfg, err := os.ReadFile(cfgPath)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(ctrPath, "main.yml"), cfg, os.ModePerm))
+		e.Run(t, "atipicial-go", "contract", "compile", "--in", srcPath)
+		defaultAefPath := ctrRootPath + ".aef"
+		defaultManifestPath := ctrRootPath + ".manifest.json"
+		defaultBindingsPath := ctrRootPath + ".bindings.yml"
+		require.FileExists(t, defaultAefPath)
+		require.FileExists(t, defaultManifestPath)
+		require.FileExists(t, defaultBindingsPath)
+	})
+}
+
+// Checks that error is returned if GAS available for test-invoke exceeds
+// GAS needed to be consumed.
+func TestDeployBigContract(t *testing.T) {
+	e := testcli.NewExecutorWithConfig(t, true, true, func(c *config.Config) {
+		c.ApplicationConfiguration.RPC.MaxGasInvoke = fixedn.Fixed8(1)
+	})
+	tmpDir := t.TempDir()
+
+	aefName := filepath.Join(tmpDir, "deploy.aef")
+	manifestName := filepath.Join(tmpDir, "deploy.manifest.json")
+	e.Run(t, "atipicial-go", "contract", "compile",
+		"--in", "testdata/deploy/main.go", // compile single file
+		"--config", "testdata/deploy/atipicial-go.yml",
+		"--out", aefName, "--manifest", manifestName)
+
+	e.In.WriteString(testcli.ValidatorPass + "\r")
+	e.RunWithError(t, "atipicial-go", "contract", "deploy",
+		"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+		"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+		"--in", aefName, "--manifest", manifestName)
+}
+
+func TestContractDeployWithData(t *testing.T) {
+	eCompile := testcli.NewExecutor(t, false)
+	tmpDir := t.TempDir()
+
+	aefName := filepath.Join(tmpDir, "deploy.aef")
+	manifestName := filepath.Join(tmpDir, "deploy.manifest.json")
+	eCompile.Run(t, "atipicial-go", "contract", "compile",
+		"--in", "testdata/deploy/main.go", // compile single file
+		"--config", "testdata/deploy/atipicial-go.yml",
+		"--out", aefName, "--manifest", manifestName)
+
+	deployContract := func(t *testing.T, haveData bool, scope string, await bool) {
+		e := testcli.NewExecutor(t, true)
+		cmd := []string{
+			"atipicial-go", "contract", "deploy",
+			"--rpc-endpoint", "http://" + e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+			"--in", aefName, "--manifest", manifestName,
+			"--force",
+		}
+
+		if await {
+			cmd = append(cmd, "--await")
+		}
+		if haveData {
+			cmd = append(cmd, "[", "key1", "12", "key2", "take_me_to_church", "]")
+		}
+		if scope != "" {
+			cmd = append(cmd, "--", testcli.ValidatorAddr+":"+scope)
+		} else {
+			scope = "CalledByEntry"
+		}
+		e.In.WriteString(testcli.ValidatorPass + "\r")
+		e.Run(t, cmd...)
+		var tx *transaction.Transaction
+		if await {
+			tx, _ = e.CheckAwaitableTxPersisted(t)
+		} else {
+			tx, _ = e.CheckTxPersisted(t)
+		}
+
+		require.Equal(t, scope, tx.Signers[0].Scopes.String())
+		if !haveData {
+			return
+		}
+
+		line, err := e.Out.ReadString('\n')
+		require.NoError(t, err)
+		line = strings.TrimSpace(strings.TrimPrefix(line, "Contract: "))
+		h, err := util.Uint160DecodeStringLE(line)
+		require.NoError(t, err)
+
+		e.Run(t, "atipicial-go", "contract", "testinvokefunction",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			h.StringLE(),
+			"getValueWithKey", "key1",
+		)
+
+		res := new(result.Invoke)
+		require.NoError(t, json.Unmarshal(e.Out.Bytes(), res))
+		require.Equal(t, vmstate.Halt.String(), res.State, res.FaultException)
+		require.Len(t, res.Stack, 1)
+		require.Equal(t, []byte{12}, res.Stack[0].Value())
+
+		e.Run(t, "atipicial-go", "contract", "testinvokefunction",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			h.StringLE(),
+			"getValueWithKey", "key2",
+		)
+
+		res = new(result.Invoke)
+		require.NoError(t, json.Unmarshal(e.Out.Bytes(), res))
+		require.Equal(t, vmstate.Halt.String(), res.State, res.FaultException)
+		require.Len(t, res.Stack, 1)
+		require.Equal(t, []byte("take_me_to_church"), res.Stack[0].Value())
+	}
+
+	deployContract(t, true, "", false)
+	deployContract(t, false, "Global", false)
+	deployContract(t, true, "Global", false)
+	deployContract(t, false, "", true)
+	deployContract(t, true, "Global", true)
+	deployContract(t, true, "", true)
+}
+
+func TestDeployWithSigners(t *testing.T) {
+	e := testcli.NewExecutor(t, true)
+	tmpDir := t.TempDir()
+
+	aefName := filepath.Join(tmpDir, "deploy.aef")
+	manifestName := filepath.Join(tmpDir, "deploy.manifest.json")
+	e.Run(t, "atipicial-go", "contract", "compile",
+		"--in", "testdata/deploy/main.go",
+		"--config", "testdata/deploy/atipicial-go.yml",
+		"--out", aefName, "--manifest", manifestName)
+
+	t.Run("missing aef", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "deploy",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+			"--in", aefName, "--manifest", manifestName)
+	})
+	t.Run("missing manifest", func(t *testing.T) {
+		e.RunWithErrorCheck(t, "required flag --manifest is empty", "atipicial-go", "contract", "deploy",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+			"--in", aefName, "--manifest", "")
+	})
+	t.Run("corrupted data", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "deploy",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+			"--in", aefName, "--manifest", manifestName,
+			"[", "str1")
+	})
+	t.Run("invalid data", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "deploy",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+			"--in", aefName, "--manifest", manifestName,
+			"str1", "str2")
+	})
+	t.Run("missing wallet", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "deploy",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--address", testcli.ValidatorAddr,
+			"--in", aefName, "--manifest", manifestName,
+			"[", "str1", "str2", "]")
+	})
+	t.Run("missing RPC", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `Required flag "rpc-endpoint" not set`, "atipicial-go", "contract", "deploy",
+			"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+			"--in", aefName, "--manifest", manifestName,
+			"[", "str1", "str2", "]")
+	})
+	e.In.WriteString(testcli.ValidatorPass + "\r")
+	e.Run(t, "atipicial-go", "contract", "deploy",
+		"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+		"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+		"--in", aefName, "--manifest", manifestName,
+		"--force",
+		"--", testcli.ValidatorAddr+":Global")
+	tx, _ := e.CheckTxPersisted(t, "Sent invocation transaction ")
+	require.Equal(t, transaction.Global, tx.Signers[0].Scopes)
+}
+
+func TestContractUpdate(t *testing.T) {
+	tmp := t.TempDir()
+	aefA := filepath.Join(tmp, "a.aef")
+	mfA := filepath.Join(tmp, "a.manifest.json")
+	aefB := filepath.Join(tmp, "b.aef")
+	mfB := filepath.Join(tmp, "b.manifest.json")
+
+	e := testcli.NewExecutor(t, true)
+	e.Run(t, "atipicial-go", "contract", "compile",
+		"--in", "testdata/deploy/main.go",
+		"--config", "testdata/deploy/atipicial-go.yml",
+		"--out", aefA, "--manifest", mfA)
+
+	e.Run(t, "atipicial-go", "contract", "compile",
+		"--in", "testdata/deploy/updated.go",
+		"--config", "testdata/deploy/atipicial-go.yml",
+		"--out", aefB, "--manifest", mfB)
+
+	e.In.WriteString(testcli.ValidatorPass + "\r")
+	e.Run(t, "atipicial-go", "contract", "deploy",
+		"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+		"--wallet", testcli.ValidatorWallet,
+		"--address", testcli.ValidatorAddr,
+		"--in", aefA, "--manifest", mfA,
+		"--force", "--await",
+	)
+	_, _ = e.CheckAwaitableTxPersisted(t)
+	line, err := e.Out.ReadString('\n')
+	require.NoError(t, err)
+	line = strings.TrimSpace(strings.TrimPrefix(line, "Contract: "))
+	hash, err := util.Uint160DecodeStringLE(line)
+	require.NoError(t, err)
+
+	e.Run(t, "atipicial-go", "contract", "testinvokefunction",
+		"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+		hash.StringLE(),
+		"getValue",
+	)
+	res := new(result.Invoke)
+	require.NoError(t, json.Unmarshal(e.Out.Bytes(), res))
+	require.Equal(t, vmstate.Halt.String(), res.State, res.FaultException)
+	require.Len(t, res.Stack, 1)
+	require.Equal(t, string(res.Stack[0].Value().([]byte)), "on create|sub create")
+
+	t.Run("missing hash", func(t *testing.T) {
+		e.RunWithErrorCheckExit(t, "no smart contract hash was provided, specify one as the first argument",
+			"atipicial-go", "contract", "update",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", aefA, "--manifest", mfA,
+		)
+	})
+
+	t.Run("invalid hash", func(t *testing.T) {
+		e.RunWithErrorCheckExit(t, "invalid contract hash",
+			"atipicial-go", "contract", "update",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", aefA, "--manifest", mfA,
+			"badhex",
+		)
+	})
+
+	t.Run("missing aef and manifest files", func(t *testing.T) {
+		e.RunWithErrorCheckExit(t, "either manifest or .aef required",
+			"atipicial-go", "contract", "update",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			testchain.PrivateKeyByID(0).GetScriptHash().StringLE(),
+		)
+	})
+
+	t.Run("malformed data param", func(t *testing.T) {
+		e.RunWithErrorCheckExit(t, "unable to parse 'data' parameter: ",
+			"atipicial-go", "contract", "update",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", aefA, "--manifest", mfA,
+			testchain.PrivateKeyByID(0).GetScriptHash().StringLE(),
+			"[",
+		)
+	})
+
+	t.Run("too many data params", func(t *testing.T) {
+		e.RunWithErrorCheckExit(t, "'data' should be represented as a single parameter",
+			"atipicial-go", "contract", "update",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", aefA, "--manifest", mfA,
+			testchain.PrivateKeyByID(0).GetScriptHash().StringLE(),
+			"one", "two",
+		)
+	})
+
+	t.Run("missing wallet", func(t *testing.T) {
+		e.RunWithErrorCheckExit(t, "can't get sender address: ",
+			"atipicial-go", "contract", "update",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", aefA, "--manifest", mfA,
+			testchain.PrivateKeyByID(0).GetScriptHash().StringLE(),
+		)
+	})
+
+	t.Run("invalid signer", func(t *testing.T) {
+		e.In.WriteString(testcli.ValidatorPass + "\r")
+		e.RunWithErrorCheckExit(t, "failed to parse signer",
+			"atipicial-go", "contract", "update",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet,
+			"--in", aefB, "--manifest", mfB,
+			"--force", "--await",
+			hash.StringLE(),
+			"--", "badSigner",
+		)
+	})
+
+	t.Run("good with only manifest", func(t *testing.T) {
+		e.In.WriteString(testcli.ValidatorPass + "\r")
+		e.Run(t, "atipicial-go", "contract", "update",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet,
+			"--manifest", "testdata/deploy/update.manifest.json",
+			"--force", "--await",
+			hash.StringLE(),
+		)
+		_, _ = e.CheckAwaitableTxPersisted(t)
+
+		e.Run(t, "atipicial-go", "contract", "testinvokefunction",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			hash.StringLE(),
+			"getValueUpdated",
+		)
+		res2 := new(result.Invoke)
+		require.NoError(t, json.Unmarshal(e.Out.Bytes(), res2))
+		require.Equal(t, vmstate.Halt.String(), res2.State, res2.FaultException)
+		require.Len(t, res2.Stack, 1)
+		require.Equal(t,
+			"on update|sub update",
+			string(res2.Stack[0].Value().([]byte)),
+		)
+	})
+
+	t.Run("good", func(t *testing.T) {
+		e.In.WriteString(testcli.ValidatorPass + "\r")
+		e.Run(t, "atipicial-go", "contract", "update",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet,
+			"--in", aefB, "--manifest", mfB,
+			"--force", "--await",
+			hash.StringLE(),
+		)
+		_, _ = e.CheckAwaitableTxPersisted(t)
+		require.NoError(t, err)
+
+		e.Run(t, "atipicial-go", "contract", "testinvokefunction",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			hash.StringLE(),
+			"newMethod",
+		)
+		require.NoError(t, json.Unmarshal(e.Out.Bytes(), res))
+		require.Equal(t, vmstate.Halt.String(), res.State, res.FaultException)
+		require.Len(t, res.Stack, 1)
+		require.Equal(t, int64(42), res.Stack[0].Value().(*big.Int).Int64())
+	})
+}
+
+func TestContractDestroy(t *testing.T) {
+	e := testcli.NewExecutor(t, true)
+	tmpDir := t.TempDir()
+
+	aefName := filepath.Join(tmpDir, "destroy.aef")
+	manifestName := filepath.Join(tmpDir, "destroy.manifest.json")
+
+	e.Run(t, "atipicial-go", "contract", "compile",
+		"--in", "testdata/deploy/main.go",
+		"--config", "testdata/deploy/atipicial-go.yml",
+		"--out", aefName, "--manifest", manifestName,
+	)
+
+	e.In.WriteString(testcli.ValidatorPass + "\r")
+	e.Run(t, "atipicial-go", "contract", "deploy",
+		"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+		"--wallet", testcli.ValidatorWallet,
+		"--address", testcli.ValidatorAddr,
+		"--in", aefName, "--manifest", manifestName,
+		"--force", "--await",
+	)
+	_, _ = e.CheckAwaitableTxPersisted(t)
+
+	line, err := e.Out.ReadString('\n')
+	require.NoError(t, err)
+	line = strings.TrimSpace(strings.TrimPrefix(line, "Contract: "))
+	hash, err := util.Uint160DecodeStringLE(line)
+	require.NoError(t, err)
+
+	e.Run(t, "atipicial-go", "contract", "testinvokefunction",
+		"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+		hash.StringLE(),
+		"getValue",
+	)
+	res := new(result.Invoke)
+	require.NoError(t, json.Unmarshal(e.Out.Bytes(), res))
+	require.Equal(t, vmstate.Halt.String(), res.State, res.FaultException)
+	require.Len(t, res.Stack, 1)
+	require.Equal(t, string(res.Stack[0].Value().([]byte)), "on create|sub create")
+
+	t.Run("missing hash", func(t *testing.T) {
+		e.RunWithErrorCheckExit(t,
+			"no smart contract hash was provided, specify one as the first argument",
+			"atipicial-go", "contract", "destroy",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+		)
+	})
+
+	t.Run("invalid hash", func(t *testing.T) {
+		e.RunWithErrorCheckExit(t,
+			"invalid contract hash",
+			"atipicial-go", "contract", "destroy",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"badhex",
+		)
+	})
+
+	t.Run("missing wallet", func(t *testing.T) {
+		e.RunWithErrorCheckExit(t,
+			"can't get sender address:",
+			"atipicial-go", "contract", "destroy",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			testchain.PrivateKeyByID(0).GetScriptHash().StringLE(),
+		)
+	})
+
+	t.Run("invalid signer", func(t *testing.T) {
+		e.In.WriteString(testcli.ValidatorPass + "\r")
+		e.RunWithErrorCheckExit(t,
+			"failed to parse signer",
+			"atipicial-go", "contract", "destroy",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+			"--force",
+			testchain.PrivateKeyByID(0).GetScriptHash().StringLE(),
+			"--",
+			"badSigner",
+		)
+	})
+
+	t.Run("good", func(t *testing.T) {
+		e.In.WriteString(testcli.ValidatorPass + "\r")
+		e.Run(t, "atipicial-go", "contract", "destroy",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet,
+			"--force", "--await",
+			hash.StringLE(),
+		)
+
+		_, _ = e.CheckAwaitableTxPersisted(t)
+		require.NoError(t, err)
+
+		e.RunWithErrorCheckExit(t,
+			fmt.Sprintf("System.Contract.Call failed: called contract %s not found: key not found", hash.StringLE()),
+			"atipicial-go", "contract", "testinvokefunction",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			hash.StringLE(), "getValue",
+		)
+	})
+}
+
+func TestContractManifestGroups(t *testing.T) {
+	e := testcli.NewExecutor(t, true)
+	tmpDir := t.TempDir()
+
+	_, err := wallet.NewWalletFromFile(testcli.TestWalletPath)
+	require.NoError(t, err)
+
+	aefName := filepath.Join(tmpDir, "deploy.aef")
+	manifestName := filepath.Join(tmpDir, "deploy.manifest.json")
+	e.Run(t, "atipicial-go", "contract", "compile",
+		"--in", "testdata/deploy/main.go", // compile single file
+		"--config", "testdata/deploy/atipicial-go.yml",
+		"--out", aefName, "--manifest", manifestName)
+
+	t.Run("missing wallet", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `Required flags "sender, address, aef, manifest" not set`, "atipicial-go", "contract", "manifest", "add-group")
+	})
+	t.Run("invalid wallet", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "manifest", "add-group",
+			"--wallet", t.TempDir(), "--sender", testcli.TestWalletAccount, "--address", testcli.TestWalletAccount,
+			"--aef", aefName, "--manifest", manifestName)
+	})
+	t.Run("invalid sender", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `invalid value "not-a-sender" for flag -sender: invalid base58 digit ('-')`, "atipicial-go", "contract", "manifest", "add-group",
+			"--wallet", testcli.TestWalletPath, "--address", testcli.TestWalletAccount,
+			"--sender", "not-a-sender", "--aef", aefName, "--manifest", manifestName)
+	})
+	t.Run("invalid AEF file", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "manifest", "add-group",
+			"--wallet", testcli.TestWalletPath, "--address", testcli.TestWalletAccount,
+			"--sender", testcli.TestWalletAccount, "--aef", tmpDir, "--manifest", manifestName)
+	})
+	t.Run("corrupted AEF file", func(t *testing.T) {
+		f := filepath.Join(tmpDir, "invalid.aef")
+		require.NoError(t, os.WriteFile(f, []byte{1, 2, 3}, os.ModePerm))
+		e.RunWithError(t, "atipicial-go", "contract", "manifest", "add-group",
+			"--wallet", testcli.TestWalletPath, "--address", testcli.TestWalletAccount,
+			"--sender", testcli.TestWalletAccount, "--aef", f, "--manifest", manifestName)
+	})
+	t.Run("invalid manifest file", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "manifest", "add-group",
+			"--wallet", testcli.TestWalletPath, "--address", testcli.TestWalletAccount,
+			"--sender", testcli.TestWalletAccount, "--aef", aefName,
+			"--manifest", tmpDir)
+	})
+	t.Run("corrupted manifest file", func(t *testing.T) {
+		f := filepath.Join(tmpDir, "invalid.manifest.json")
+		require.NoError(t, os.WriteFile(f, []byte{1, 2, 3}, os.ModePerm))
+		e.RunWithError(t, "atipicial-go", "contract", "manifest", "add-group",
+			"--wallet", testcli.TestWalletPath, "--address", testcli.TestWalletAccount,
+			"--sender", testcli.TestWalletAccount, "--aef", aefName,
+			"--manifest", f)
+	})
+	t.Run("unknown account", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "manifest", "add-group",
+			"--wallet", testcli.TestWalletPath, "--address", util.Uint160{}.StringLE(),
+			"--sender", testcli.TestWalletAccount, "--aef", aefName,
+			"--manifest", manifestName)
+	})
+	cmd := []string{"atipicial-go", "contract", "manifest", "add-group",
+		"--aef", aefName, "--manifest", manifestName}
+
+	t.Run("excessive parameters", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "--wallet", testcli.TestWalletPath,
+			"--sender", testcli.TestWalletAccount, "--address", testcli.TestWalletAccount, "something")...)
+	})
+	e.In.WriteString("testpass\r")
+	e.Run(t, append(cmd, "--wallet", testcli.TestWalletPath,
+		"--sender", testcli.TestWalletAccount, "--address", testcli.TestWalletAccount)...)
+
+	e.In.WriteString("testpass\r") // should override signature with the previous sender
+	e.Run(t, append(cmd, "--wallet", testcli.TestWalletPath,
+		"--sender", testcli.ValidatorAddr, "--address", testcli.TestWalletAccount)...)
+
+	e.In.WriteString(testcli.ValidatorPass + "\r")
+	e.Run(t, "atipicial-go", "contract", "deploy",
+		"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+		"--in", aefName, "--manifest", manifestName,
+		"--force",
+		"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr)
+}
+
+func deployVerifyContract(t *testing.T, e *testcli.Executor) util.Uint160 {
+	return testcli.DeployContract(t, e, "testdata/verify.go", "testdata/verify.yml", testcli.ValidatorWallet, testcli.ValidatorAddr, testcli.ValidatorPass)
+}
+
+func TestContract_TestInvokeScript(t *testing.T) {
+	e := testcli.NewExecutor(t, true)
+	tmpDir := t.TempDir()
+	badAef := filepath.Join(tmpDir, "invalid.aef")
+	goodAef := filepath.Join(tmpDir, "deploy.aef")
+	manifestName := filepath.Join(tmpDir, "deploy.manifest.json")
+	e.Run(t, "atipicial-go", "contract", "compile",
+		"--in", "testdata/deploy/main.go", // compile single file
+		"--config", "testdata/deploy/atipicial-go.yml",
+		"--out", goodAef, "--manifest", manifestName)
+
+	t.Run("missing in", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `Required flag "in" not set`, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0])
+	})
+	t.Run("empty in", func(t *testing.T) {
+		e.RunWithErrorCheck(t, "required flag --in is empty", "atipicial-go", "contract", "testinvokescript", "-i", "",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0])
+	})
+	t.Run("empty rpc", func(t *testing.T) {
+		e.RunWithErrorCheck(t, "required flag --rpc-endpoint is empty", "atipicial-go", "contract", "testinvokescript", "-i", goodAef,
+			"--rpc-endpoint", "")
+	})
+	t.Run("unexisting in", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", badAef)
+	})
+	t.Run("invalid aef", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(badAef, []byte("qwer"), os.ModePerm))
+		e.RunWithError(t, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", badAef)
+	})
+	t.Run("invalid signers", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", goodAef, "--", "not-a-valid-signer")
+	})
+	t.Run("no RPC endpoint", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://123456789",
+			"--in", goodAef)
+	})
+	t.Run("good", func(t *testing.T) {
+		e.Run(t, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", goodAef)
+	})
+	t.Run("good with hashed signer", func(t *testing.T) {
+		e.Run(t, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", goodAef, "--", util.Uint160{1, 2, 3}.StringLE())
+	})
+	t.Run("good with addressed signer", func(t *testing.T) {
+		e.Run(t, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--in", goodAef, "--", address.Uint160ToString(util.Uint160{1, 2, 3}))
+	})
+	t.Run("historic, invalid", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--historic", "bad",
+			"--in", goodAef)
+	})
+	t.Run("historic, index", func(t *testing.T) {
+		e.Run(t, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--historic", "0",
+			"--in", goodAef)
+	})
+	t.Run("historic, hash", func(t *testing.T) {
+		e.Run(t, "atipicial-go", "contract", "testinvokescript",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--historic", e.Chain.GetHeaderHash(0).StringLE(),
+			"--in", goodAef)
+	})
+}
+
+func TestComlileAndInvokeFunction(t *testing.T) {
+	e := testcli.NewExecutor(t, true)
+	tmpDir := t.TempDir()
+
+	aefName := filepath.Join(tmpDir, "deploy.aef")
+	manifestName := filepath.Join(tmpDir, "deploy.manifest.json")
+	e.Run(t, "atipicial-go", "contract", "compile",
+		"--in", "testdata/deploy/main.go", // compile single file
+		"--config", "testdata/deploy/atipicial-go.yml",
+		"--out", aefName, "--manifest", manifestName)
+
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml")
+	cfg := config.Wallet{
+		Path:     testcli.ValidatorWallet,
+		Password: testcli.ValidatorPass,
+	}
+	yml, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(configPath, yml, 0666))
+	e.Run(t, "atipicial-go", "contract", "deploy",
+		"--rpc-endpoint", "http://"+e.RPC.Addresses()[0], "--force",
+		"--wallet-config", configPath, "--address", testcli.ValidatorAddr,
+		"--in", aefName, "--manifest", manifestName)
+
+	e.CheckTxPersisted(t, "Sent invocation transaction ")
+	line, err := e.Out.ReadString('\n')
+	require.NoError(t, err)
+	line = strings.TrimSpace(strings.TrimPrefix(line, "Contract: "))
+	h, err := util.Uint160DecodeStringLE(line)
+	require.NoError(t, err)
+
+	t.Run("check calc hash", func(t *testing.T) {
+		// missing sender
+		e.RunWithErrorCheck(t, `Required flag "sender" not set`, "atipicial-go", "contract", "calc-hash",
+			"--in", aefName,
+			"--manifest", manifestName)
+
+		e.Run(t, "atipicial-go", "contract", "calc-hash",
+			"--sender", testcli.ValidatorAddr, "--in", aefName,
+			"--manifest", manifestName)
+		e.CheckNextLine(t, h.StringLE())
+	})
+
+	cmd := []string{"atipicial-go", "contract", "testinvokefunction",
+		"--rpc-endpoint", "http://" + e.RPC.Addresses()[0]}
+	checkGetValueOut := func(expected any) {
+		res := new(result.Invoke)
+		require.NoError(t, json.Unmarshal(e.Out.Bytes(), res))
+		require.Equal(t, vmstate.Halt.String(), res.State, res.FaultException)
+		require.Len(t, res.Stack, 1)
+		require.Equal(t, expected, res.Stack[0].Value())
+	}
+	t.Run("missing hash", func(t *testing.T) {
+		e.RunWithError(t, cmd...)
+	})
+	t.Run("invalid hash", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "notahash")...)
+	})
+	t.Run("native hash", func(t *testing.T) {
+		e.Run(t, append(cmd, nativenames.Policy, "getFeePerByte")...)
+		checkGetValueOut(big.NewInt(1000))
+	})
+
+	cmd = append(cmd, h.StringLE())
+	t.Run("missing method", func(t *testing.T) {
+		e.RunWithError(t, cmd...)
+	})
+
+	cmd = append(cmd, "getValue")
+	t.Run("invalid params", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "[")...)
+	})
+	t.Run("invalid cosigner", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "--", "notahash")...)
+	})
+	t.Run("missing RPC address", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `Required flag "rpc-endpoint" not set`, "atipicial-go", "contract", "testinvokefunction",
+			h.StringLE(), "getValue")
+	})
+
+	e.Run(t, cmd...)
+	checkGetValueOut([]byte("on create|sub create"))
+
+	// deploy verification contract
+	hVerify := deployVerifyContract(t, e)
+
+	t.Run("real invoke", func(t *testing.T) {
+		cmd := []string{"atipicial-go", "contract", "invokefunction",
+			"--rpc-endpoint", "http://" + e.RPC.Addresses()[0]}
+		t.Run("missing wallet", func(t *testing.T) {
+			cmd := append(cmd, h.StringLE(), "getValue")
+			e.RunWithError(t, cmd...)
+		})
+		t.Run("non-existent wallet", func(t *testing.T) {
+			cmd := append(cmd, "--wallet", filepath.Join(tmpDir, "not.exists"),
+				h.StringLE(), "getValue")
+			e.RunWithError(t, cmd...)
+		})
+		t.Run("corrupted wallet", func(t *testing.T) {
+			tmp := t.TempDir()
+			tmpPath := filepath.Join(tmp, "wallet.json")
+			require.NoError(t, os.WriteFile(tmpPath, []byte("{"), os.ModePerm))
+
+			cmd := append(cmd, "--wallet", tmpPath,
+				h.StringLE(), "getValue")
+			e.RunWithError(t, cmd...)
+		})
+		t.Run("non-existent address", func(t *testing.T) {
+			cmd := append(cmd, "--wallet", testcli.ValidatorWallet,
+				"--address", random.Uint160().StringLE(),
+				h.StringLE(), "getValue")
+			e.RunWithError(t, cmd...)
+		})
+		t.Run("invalid password", func(t *testing.T) {
+			e.In.WriteString("invalid_password\r")
+			cmd := append(cmd, "--wallet", testcli.ValidatorWallet,
+				h.StringLE(), "getValue")
+			e.RunWithError(t, cmd...)
+		})
+		t.Run("good: default address", func(t *testing.T) {
+			e.In.WriteString("one\r")
+			e.In.WriteString("y\r")
+			e.Run(t, append(cmd, "--wallet", testcli.ValidatorWallet, h.StringLE(), "getValue")...)
+		})
+		t.Run("good: from wallet config", func(t *testing.T) {
+			e.In.WriteString("y\r")
+			e.Run(t, append(cmd, "--wallet-config", configPath, h.StringLE(), "getValue")...)
+		})
+
+		cmd = append(cmd, "--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr)
+		t.Run("cancelled", func(t *testing.T) {
+			e.In.WriteString("one\r")
+			e.In.WriteString("n\r")
+			e.RunWithError(t, append(cmd, h.StringLE(), "getValue")...)
+		})
+		t.Run("confirmed", func(t *testing.T) {
+			e.In.WriteString("one\r")
+			e.In.WriteString("y\r")
+			e.Run(t, append(cmd, h.StringLE(), "getValue")...)
+		})
+
+		t.Run("failind method", func(t *testing.T) {
+			e.In.WriteString("one\r")
+			e.In.WriteString("y\r")
+			e.RunWithError(t, append(cmd, h.StringLE(), "fail")...)
+
+			e.In.WriteString("one\r")
+			e.Run(t, append(cmd, "--force", h.StringLE(), "fail")...)
+		})
+
+		t.Run("cosigner is deployed contract", func(t *testing.T) {
+			e.In.WriteString("one\r")
+			e.In.WriteString("y\r")
+			e.Run(t, append(cmd, h.StringLE(), "getValue",
+				"--", testcli.ValidatorAddr, hVerify.StringLE())...)
+		})
+
+		t.Run("with await", func(t *testing.T) {
+			e.In.WriteString("one\r")
+			e.Run(t, append(cmd, "--force", "--await", h.StringLE(), "getValue")...)
+			e.CheckAwaitableTxPersisted(t)
+		})
+	})
+
+	t.Run("real invoke and save tx", func(t *testing.T) {
+		txout := filepath.Join(tmpDir, "test_contract_tx.json")
+
+		cmd = []string{"atipicial-go", "contract", "invokefunction",
+			"--rpc-endpoint", "http://" + e.RPC.Addresses()[0],
+			"--out", txout,
+			"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+		}
+
+		t.Run("without cosigner", func(t *testing.T) {
+			e.In.WriteString("one\r")
+			e.Run(t, append(cmd, hVerify.StringLE(), "verify")...)
+		})
+
+		t.Run("with cosigner", func(t *testing.T) {
+			t.Run("cosigner is sender (none)", func(t *testing.T) {
+				e.In.WriteString("one\r")
+				e.RunWithError(t, append(cmd, h.StringLE(), "checkSenderWitness", "--", testcli.ValidatorAddr+":None")...)
+			})
+			t.Run("cosigner is sender (customcontract)", func(t *testing.T) {
+				e.In.WriteString("one\r")
+				e.Run(t, append(cmd, h.StringLE(), "checkSenderWitness", "--", testcli.ValidatorAddr+":CustomContracts:"+h.StringLE())...)
+			})
+			t.Run("cosigner is sender (global)", func(t *testing.T) {
+				e.In.WriteString("one\r")
+				e.Run(t, append(cmd, h.StringLE(), "checkSenderWitness", "--", testcli.ValidatorAddr+":Global")...)
+			})
+
+			acc, err := wallet.NewAccount()
+			require.NoError(t, err)
+			pk, err := keys.NewPrivateKey()
+			require.NoError(t, err)
+			err = acc.ConvertMultisig(2, keys.PublicKeys{acc.PublicKey(), pk.PublicKey()})
+			require.NoError(t, err)
+
+			t.Run("cosigner is multisig account", func(t *testing.T) {
+				t.Run("missing in the wallet", func(t *testing.T) {
+					e.In.WriteString("one\r")
+					e.RunWithError(t, append(cmd, hVerify.StringLE(), "verify", "--", acc.Address)...)
+				})
+
+				t.Run("good", func(t *testing.T) {
+					e.In.WriteString("one\r")
+					e.Run(t, append(cmd, hVerify.StringLE(), "verify", "--", testcli.MultisigAddr)...)
+				})
+			})
+
+			t.Run("cosigner is deployed contract", func(t *testing.T) {
+				t.Run("missing in the wallet", func(t *testing.T) {
+					e.In.WriteString("one\r")
+					e.RunWithError(t, append(cmd, hVerify.StringLE(), "verify", "--", h.StringLE())...)
+				})
+
+				t.Run("good", func(t *testing.T) {
+					e.In.WriteString("one\r")
+					e.Run(t, append(cmd, hVerify.StringLE(), "verify", "--", hVerify.StringLE())...)
+				})
+			})
+		})
+	})
+
+	t.Run("test Storage.Find", func(t *testing.T) {
+		cmd := []string{"atipicial-go", "contract", "testinvokefunction",
+			"--rpc-endpoint", "http://" + e.RPC.Addresses()[0],
+			h.StringLE(), "testFind"}
+
+		t.Run("keys only", func(t *testing.T) {
+			e.Run(t, append(cmd, strconv.FormatInt(storage.FindKeysOnly, 10))...)
+			res := new(result.Invoke)
+			require.NoError(t, json.Unmarshal(e.Out.Bytes(), res))
+			require.Equal(t, vmstate.Halt.String(), res.State)
+			require.Len(t, res.Stack, 1)
+			require.Equal(t, []stackitem.Item{
+				stackitem.Make("findkey1"),
+				stackitem.Make("findkey2"),
+			}, res.Stack[0].Value())
+		})
+		t.Run("both", func(t *testing.T) {
+			e.Run(t, append(cmd, strconv.FormatInt(storage.FindDefault, 10))...)
+			res := new(result.Invoke)
+			require.NoError(t, json.Unmarshal(e.Out.Bytes(), res))
+			require.Equal(t, vmstate.Halt.String(), res.State)
+			require.Len(t, res.Stack, 1)
+
+			arr, ok := res.Stack[0].Value().([]stackitem.Item)
+			require.True(t, ok)
+			require.Len(t, arr, 2)
+			require.Equal(t, []stackitem.Item{
+				stackitem.Make("findkey1"), stackitem.Make("value1"),
+			}, arr[0].Value())
+			require.Equal(t, []stackitem.Item{
+				stackitem.Make("findkey2"), stackitem.Make("value2"),
+			}, arr[1].Value())
+		})
+	})
+
+	var (
+		hashBeforeUpdate  util.Uint256
+		indexBeforeUpdate uint32
+		indexAfterUpdate  uint32
+		stateBeforeUpdate util.Uint256
+	)
+	t.Run("Update", func(t *testing.T) {
+		aefName := filepath.Join(tmpDir, "updated.aef")
+		manifestName := filepath.Join(tmpDir, "updated.manifest.json")
+		e.Run(t, "atipicial-go", "contract", "compile",
+			"--config", "testdata/deploy/atipicial-go.yml",
+			"--in", "testdata/deploy/", // compile all files in dir
+			"--out", aefName, "--manifest", manifestName)
+
+		t.Cleanup(func() {
+			os.Remove(aefName)
+			os.Remove(manifestName)
+		})
+
+		rawAef, err := os.ReadFile(aefName)
+		require.NoError(t, err)
+		rawManifest, err := os.ReadFile(manifestName)
+		require.NoError(t, err)
+
+		indexBeforeUpdate = e.Chain.BlockHeight()
+		hashBeforeUpdate = e.Chain.CurrentHeaderHash()
+		mptBeforeUpdate, err := e.Chain.GetStateRoot(indexBeforeUpdate)
+		require.NoError(t, err)
+		stateBeforeUpdate = mptBeforeUpdate.Root
+		e.In.WriteString("one\r")
+		e.Run(t, "atipicial-go", "contract", "invokefunction",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			"--wallet", testcli.ValidatorWallet, "--address", testcli.ValidatorAddr,
+			"--force",
+			h.StringLE(), "update",
+			"bytes:"+hex.EncodeToString(rawAef),
+			"bytes:"+hex.EncodeToString(rawManifest),
+			"",
+		)
+		e.CheckTxPersisted(t, "Sent invocation transaction ")
+
+		indexAfterUpdate = e.Chain.BlockHeight()
+		e.In.WriteString("one\r")
+		e.Run(t, "atipicial-go", "contract", "testinvokefunction",
+			"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+			h.StringLE(), "getValue")
+		checkGetValueOut([]byte("on update|sub update"))
+	})
+	t.Run("historic", func(t *testing.T) {
+		t.Run("bad ref", func(t *testing.T) {
+			e.RunWithError(t, "atipicial-go", "contract", "testinvokefunction",
+				"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+				"--historic", "bad",
+				h.StringLE(), "getValue")
+		})
+		for name, ref := range map[string]string{
+			"by index":      strconv.FormatUint(uint64(indexBeforeUpdate), 10),
+			"by block hash": hashBeforeUpdate.StringLE(),
+			"by state hash": stateBeforeUpdate.StringLE(),
+		} {
+			t.Run(name, func(t *testing.T) {
+				e.Run(t, "atipicial-go", "contract", "testinvokefunction",
+					"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+					"--historic", ref,
+					h.StringLE(), "getValue")
+			})
+			checkGetValueOut([]byte("on create|sub create"))
+		}
+		t.Run("updated historic", func(t *testing.T) {
+			e.Run(t, "atipicial-go", "contract", "testinvokefunction",
+				"--rpc-endpoint", "http://"+e.RPC.Addresses()[0],
+				"--historic", strconv.FormatUint(uint64(indexAfterUpdate), 10),
+				h.StringLE(), "getValue")
+			checkGetValueOut([]byte("on update|sub update"))
+		})
+	})
+}
+
+func TestContractInspect(t *testing.T) {
+	e := testcli.NewExecutor(t, false)
+	const srcPath = "testdata/deploy/main.go"
+	tmpDir := t.TempDir()
+
+	aefName := filepath.Join(tmpDir, "deploy.aef")
+	manifestName := filepath.Join(tmpDir, "deploy.manifest.json")
+	e.Run(t, "atipicial-go", "contract", "compile",
+		"--in", srcPath,
+		"--config", "testdata/deploy/atipicial-go.yml",
+		"--out", aefName, "--manifest", manifestName)
+
+	cmd := []string{"atipicial-go", "contract", "inspect"}
+	t.Run("missing input", func(t *testing.T) {
+		e.RunWithErrorCheck(t, `Required flag "in" not set`, cmd...)
+	})
+	t.Run("with raw '.go'", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "--in", srcPath)...)
+		e.Run(t, append(cmd, "--in", srcPath, "--compile")...)
+		require.True(t, strings.Contains(e.Out.String(), "SYSCALL"))
+	})
+	t.Run("with aef", func(t *testing.T) {
+		e.RunWithError(t, append(cmd, "--in", aefName, "--compile")...)
+		e.RunWithError(t, append(cmd, "--in", filepath.Join(tmpDir, "not.exists"))...)
+		e.RunWithError(t, append(cmd, "--in", aefName, "something")...)
+		e.Run(t, append(cmd, "--in", aefName)...)
+		require.True(t, strings.Contains(e.Out.String(), "SYSCALL"))
+	})
+}
+
+func TestCompileExamples(t *testing.T) {
+	tmpDir := t.TempDir()
+	const examplePath = "../../examples"
+	infos, err := os.ReadDir(examplePath)
+	require.NoError(t, err)
+
+	e := testcli.NewExecutor(t, false)
+
+	for _, info := range infos {
+		if !info.IsDir() {
+			// example smart contracts are located in the `/examples` subdirectories, but
+			// there are also a couple of files inside the `/examples` which doesn't need to be compiled
+			continue
+		}
+		if info.Name() == "zkp" {
+			// A set of special ZKP-related examples, they have their own tests.
+			continue
+		}
+		t.Run(info.Name(), func(t *testing.T) {
+			infos, err := os.ReadDir(filepath.Join(examplePath, info.Name()))
+			require.NoError(t, err)
+			require.False(t, len(infos) == 0, "detected smart contract folder with no contract in it")
+
+			outF := filepath.Join(tmpDir, info.Name()+".aef")
+			manifestF := filepath.Join(tmpDir, info.Name()+".manifest.json")
+			bindingF := filepath.Join(tmpDir, info.Name()+".binding.yml")
+			wrapperF := filepath.Join(tmpDir, info.Name()+".go")
+			rpcWrapperF := filepath.Join(tmpDir, info.Name()+".rpc.go")
+
+			cfgName := filterFilename(infos, ".yml")
+			opts := []string{
+				"atipicial-go", "contract", "compile",
+				"--in", filepath.Join(examplePath, info.Name()),
+				"--out", outF,
+				"--manifest", manifestF,
+				"--config", filepath.Join(examplePath, info.Name(), cfgName),
+				"--bindings", bindingF,
+			}
+			e.Run(t, opts...)
+
+			if info.Name() == "storage" {
+				rawM, err := os.ReadFile(manifestF)
+				require.NoError(t, err)
+
+				m := new(manifest.Manifest)
+				require.NoError(t, json.Unmarshal(rawM, m))
+
+				require.Nil(t, m.ABI.GetMethod("getDefault", 0))
+				require.NotNil(t, m.ABI.GetMethod("get", 0))
+				require.NotNil(t, m.ABI.GetMethod("get", 1))
+
+				require.Nil(t, m.ABI.GetMethod("putDefault", 1))
+				require.NotNil(t, m.ABI.GetMethod("put", 1))
+				require.NotNil(t, m.ABI.GetMethod("put", 2))
+			}
+			e.Run(t, "atipicial-go", "contract", "generate-wrapper",
+				"--manifest", manifestF,
+				"--config", bindingF,
+				"--out", wrapperF,
+				"--hash", "0x00112233445566778899aabbccddeeff00112233")
+			e.Run(t, "atipicial-go", "contract", "generate-rpcwrapper",
+				"--manifest", manifestF,
+				"--config", bindingF,
+				"--out", rpcWrapperF,
+				"--hash", "0x00112233445566778899aabbccddeeff00112233")
+		})
+	}
+
+	t.Run("invalid manifest", func(t *testing.T) {
+		const dir = "./testdata/"
+		for _, name := range []string{"invalid1", "invalid2", "invalid3", "invalid4"} {
+			outF := filepath.Join(tmpDir, name+".aef")
+			manifestF := filepath.Join(tmpDir, name+".manifest.json")
+			e.RunWithError(t, "atipicial-go", "contract", "compile",
+				"--in", filepath.Join(dir, name),
+				"--out", outF,
+				"--manifest", manifestF,
+				"--config", filepath.Join(dir, name, "invalid.yml"),
+			)
+		}
+	})
+}
+
+func filterFilename(infos []os.DirEntry, ext string) string {
+	for _, info := range infos {
+		if !info.IsDir() {
+			name := info.Name()
+			if strings.HasSuffix(name, ext) {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+func TestContractCompile_AEFSizeCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	e := testcli.NewExecutor(t, false)
+
+	src := `package aefconstraints
+       var data = "%s"
+
+       func Main() string {
+               return data
+       }`
+	data := make([]byte, stackitem.MaxSize-10)
+	for i := range data {
+		data[i] = byte('a')
+	}
+
+	in := filepath.Join(tmpDir, "main.go")
+	cfg := filepath.Join(tmpDir, "main.yml")
+	require.NoError(t, os.WriteFile(cfg, []byte("name: main"), os.ModePerm))
+	require.NoError(t, os.WriteFile(in, fmt.Appendf(nil, src, data), os.ModePerm))
+
+	e.RunWithError(t, "atipicial-go", "contract", "compile", "--in", in)
+	require.NoFileExists(t, filepath.Join(tmpDir, "main.aef"))
+}

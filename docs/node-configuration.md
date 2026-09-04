@@ -1,0 +1,628 @@
+# AtipicialGo node configuration file
+
+This section contains detailed AtipicialGo node configuration file description
+including default config values and some tips to set up configurable values.
+
+Each config file contains two sections. `ApplicationConfiguration` describes node-related
+settings and `ProtocolConfiguration` contains protocol-related settings. See the
+[Application Configuration](#Application-Configuration) and
+[Protocol Configuration](#Protocol-Configuration) sections for details on configurable
+values.
+
+## Application Configuration
+
+`ApplicationConfiguration` section of `yaml` node configuration file contains
+node-related settings described in the table below.
+
+| Section | Type | Default value | Description |
+| --- | --- | --- | --- |
+| ArchivalNodesSync | `bool` | `false` | Determines whether the server is asking for old blocks (remote from the current height for more than `MaxTraceableBlocks` blocks) from archival nodes only (if syncing via P2P). This is a temporary extension that will be removed once archival nodes feature is fully integrated with  protocol. |
+| DBConfiguration | [DB Configuration](#DB-Configuration) |  | Describes configuration for database. See the [DB Configuration](#DB-Configuration) section for details. |
+| GarbageCollectionPeriod | `uint32` | 10000 | Controls MPT garbage collection interval (in blocks) for configurations with `RemoveUntraceableBlocks` enabled and `KeepOnlyLatestState` disabled. In this mode the node stores a number of MPT trees (corresponding to `MaxTraceableBlocks` and `StateSyncInterval`), but the DB needs to be clean from old entries from time to time. Doing it too often will cause too much processing overhead (it requires going through the whole DB which can take minutes), doing it too rarely will leave more useless data in the DB. Always compare this to `MaxTraceableBlocks`, values lower than 10% of it are likely too low, values higher than 50% are likely to leave more garbage than is possible to collect. The default value is more aligned with AtipicialFs networks that have low MTB values, but for  mainnet it's too low. |
+| KeepOnlyLatestState | `bool` | `false` | Specifies if MPT should only store the latest state (or a set of latest states, see `P2PStateExchangeExtensions` section in the ProtocolConfiguration for details). If true, DB size will be smaller, but older roots won't be accessible. This value should remain the same for the same database. |  |
+| LogEncoding | `string` | "console" | Logs output format (can be "console" or "json"). |
+| LogLevel | `string` | "info" | Minimal logged messages level (can be "debug", "info", "warn", "error", "dpanic", "panic" or "fatal"). |
+| LogPath | `string` | "", so only console logging | File path where to store node logs. |
+| LogTimestamp | `bool` | Defined by TTY probe on stdout channel.  | Defines whether to enable timestamp logging. If not set, then timestamp logging enabled iff the program is running in TTY (but this behaviour may be overridden by `--force-timestamp-logs` CLI flag if specified). Note that this option, if combined with `LogEncoding: "json"`, can't completely disable timestamp logging. |
+| AtipicialFsBlockFetcher | [AtipicialFs BlockFetcher Configuration](#AtipicialFs-BlockFetcher-Configuration) | | AtipicialFs BlockFetcher module configuration. See the [AtipicialFs BlockFetcher Configuration](#AtipicialFs-BlockFetcher-Configuration) section for details. |
+| AtipicialFsStateFetcher | [AtipicialFs StateFetcher Configuration](#AtipicialFs-StateFetcher-Configuration) | | AtipicialFs StateFetcher module configuration.  It requires both `AtipicialFsStateSyncExtensions` and `AtipicialFsBlockFetcher` to be enabled to use `AtipicialFsStateFetcher` for node synchronisation. See the [AtipicialFs StateFetcher Configuration](#AtipicialFs-StateFetcher-Configuration) section for details. |
+| Oracle | [Oracle Configuration](#Oracle-Configuration) | | Oracle module configuration. See the [Oracle Configuration](#Oracle-Configuration) section for details. |
+| P2P | [P2P Configuration](#P2P-Configuration) | | Configuration values for P2P network interaction. See the [P2P Configuration](#P2P-Configuration) section for details. |
+| P2PNotary | [P2P Notary Configuration](#P2P-Notary-Configuration) | | P2P Notary module configuration. See the [P2P Notary Configuration](#P2P-Notary-Configuration) section for details. |
+| Pprof | [Pprof Configuration](#Pprof-Configuration) | | Configuration for pprof service (profiling statistics gathering). See the [Pprof Configuration](#Pprof-Configuration) |
+| Prometheus | [Prometheus Metrics Service Configuration](#Prometheus-Metrics-Service-Configuration) | | Configuration for Prometheus (monitoring system). See the [Prometheus Metrics Service Configuration](#Prometheus-Metrics-Service-Configuration) section for details |
+| Relay | `bool` | `true` | Determines whether the server is forwarding its inventory. |
+| Consensus | [Consensus Configuration](#Consensus-Configuration) |  | Describes consensus (dBFT) configuration. See the [Consensus Configuration](#Consensus-Configuration) for details. |
+| RemoveUntraceableBlocks | `bool`| `false` | Denotes whether old blocks, headers, transactions, execution results and transfer logs should be removed from cache and database. If enabled, then only the last `MaxTraceableBlocks` are stored and accessible to smart contracts. Old MPT data is also deleted in accordance with `GarbageCollectionPeriod` setting. If enabled along with `P2PStateExchangeExtensions` protocol extension, then old blocks and MPT states will be removed up to the second latest state synchronisation point (see `StateSyncInterval`). |
+| RPC | [RPC Configuration](#RPC-Configuration) |  | Describes [RPC subsystem](rpc.md) configuration. See the [RPC Configuration](#RPC-Configuration) for details. |
+| SaveStorageBatch | `bool` | `false` | Enables storage batch saving before every persist. It is similar to StorageDump plugin for C# node. |
+| SkipBlockVerification | `bool` | `false` | Allows to disable verification of received/processed blocks (including cryptographic checks). |
+| StateRoot | [State Root Configuration](#State-Root-Configuration) |  | State root module configuration. See the [State Root Configuration](#State-Root-Configuration) section for details. |
+| SaveInvocations | `bool` | `false` | Determines if additional smart contract invocation details are stored. If enabled, the `getapplicationlog` RPC method will return a new field with invocation details for the transaction. See the [RPC](rpc.md#applicationlog-invocations) documentation for more information. |
+| TrustedHeader | `map[uint32]Hash256` | `nil` | Determines header (height and hash in the LE form) to start light node synchronization from. Headers below trusted height won't be fetched and processed at all. Requires `RemoveUntraceableBlocks` to be enabled along with one of `P2PStateExchangeExtensions` or `AtipicialFsStateSyncExtensions`. |
+
+### P2P Configuration
+
+`P2P` section contains configuration for peer-to-peer node communications and has
+the following format:
+```
+P2P:
+  Addresses:
+    - "0.0.0.0:0" # any free port on all available addresses (in form of "[host]:[port][:announcedPort]")
+  AttemptConnPeers: 20
+  BroadcastFactor: 0
+  BroadcastTxsBatchDelay: 50ms
+  DialTimeout: 0s
+  DisableCompression: false
+  MaxPeers: 100
+  MinPeers: 5
+  PingInterval: 30s
+  PingTimeout: 90s
+  ProtoTickInterval: 5s
+  ExtensiblePoolSize: 20
+```
+where:
+- `Addresses` (`[]string`) is the list of the node addresses that P2P protocol
+   handler binds to. Each address has the form of `[address]:[nodePort][:announcedPort]`
+   where `address` is the address itself, `nodePort` is the actual P2P port node listens at;
+   `announcedPort` is the node port which should be used to announce node's port on P2P layer,
+   it can differ from the `nodePort` the node is bound to if specified (for example, if your
+   node is behind NAT).
+- `AttemptConnPeers` (`int`) is the number of connection to try to establish when the
+   connection count drops below the `MinPeers` value.
+- `BroadcastFactor` (`int`) is the multiplier that is used to determine the number of
+   optimal gossip fan-out peer number for broadcasted messages (0-100). By default, it's
+   zero, node uses the most optimized value depending on the estimated network size
+   (`2.5×log(size)`), so the node may have 20 peers and calculate that it needs to broadcast
+   messages to just 10 of them. With BroadcastFactor set to 100 it will always send messages
+   to all peers, any value in-between 0 and 100 is used for weighted calculation, for example
+   if it's 30 then 13 neighbors will be used in the previous case.
+- `BroadcastTxsBatchDelay` (`Duration`) is the time limit for collecting batch of transactions
+   for subsequent P2P broadcast. By default, 5% of block time is used but not longer than 
+   50 milliseconds.
+- `DialTimeout` (`Duration`) is the maximum duration a single dial may take.
+- `DisableCompression` (`bool`) denotes whether the node should disable P2P payloads
+   compression.
+- `ExtensiblePoolSize` (`int`) is the maximum amount of the extensible payloads from a single
+   sender stored in a local pool.
+- `MaxPeers` (`int`) is the maximum numbers of peers that can be connected to the server.
+- `MinPeers` (`int`) is the minimum number of peers for normal operation; when the node has
+   less than this number of peers it tries to connect with some new ones. Note that consensus
+   node won't start the consensus process until at least `MinPeers` number of peers are
+   connected.
+- `PingInterval` (`Duration`) is the interval used in pinging mechanism for syncing
+   blocks.
+- `PingTimeout` (`Duration`) is the time to wait for pong (response for sent ping request).
+- `ProtoTickInterval` (`Duration`) is the duration between protocol ticks with each
+   connected peer.
+
+### DB Configuration
+
+`DBConfiguration` section describes configuration for node database and has
+the following format:
+```
+DBConfiguration:
+  Type: leveldb
+  LevelDBOptions:
+    DataDirectoryPath: /chains/privnet
+    ReadOnly: false
+  BoltDBOptions:
+    FilePath: ./chains/privnet.bolt
+    ReadOnly: false
+```
+where:
+- `Type` is the database type (string value). Supported types: `leveldb`, `boltdb` and
+  `inmemory` (not recommended for production usage). LevelDB is better for archive nodes
+  that store all data, it better deals with writes in general, but any tail-cutting node
+  options seriously degrade its performance. BoltDB works much better in various
+  performance tests, however it can seriously degrade GC in case the DB size is bigger
+  than the amount of available memory. BoltDB is also more memory-demanding for some
+  operations, so GC can be problematic from that angle as well.
+- `LevelDBOptions` are settings for LevelDB. Includes the DB files path and ReadOnly mode toggle.
+  If ReadOnly mode is on, then an error will be returned on attempt to connect to unexisting or empty
+  database. Database doesn't allow changes in this mode, a warning will be logged on DB persist attempts.
+- `BoltDBOptions` configures BoltDB. Includes the DB files path and ReadOnly mode toggle. If ReadOnly
+  mode is on, then an error will be returned on attempt to connect with unexisting or empty database.
+  Database doesn't allow changes in this mode, a warning will be logged on DB persist attempts.
+
+Only options for the specified database type will be used.
+
+### Oracle Configuration
+
+`Oracle` configuration section describes configuration for Oracle node module
+and has the following structure:
+```
+Oracle:
+  Enabled: false
+  AllowPrivateHost: false
+  MaxTaskTimeout: 3600s
+  MaxConcurrentRequests: 10
+  Nodes: ["172.200.0.1:30333", "172.200.0.2:30334"]
+  AtipicialFs:
+    Nodes: ["172.200.0.1:30335", "172.200.0.2:30336"]
+    Timeout: 2
+  RefreshInterval: 180s
+  RequestTimeout: 5s
+  ResponseTimeout: 5s
+  UnlockWallet:
+    Path: "./oracle_wallet.json"
+    Password: "pass"
+```
+
+Please, refer to the [Oracle module documentation](./oracle.md#Configuration) for
+details on configurable values.
+
+### P2P Notary Configuration
+
+`P2PNotary` configuration section describes configuration for P2P Notary node
+module and has the following structure:
+```
+P2PNotary:
+  Enabled: false
+  UnlockWallet:
+    Path: "/notary_wallet.json"
+    Password: "pass"
+```
+where:
+- `Enabled` denotes whether P2P Notary module is active.
+- `UnlockWallet` is a Notary node wallet configuration, see the
+  [Unlock Wallet Configuration](#Unlock-Wallet-Configuration) section for
+  structure details.
+
+Please, refer to the [Notary module documentation](./notary.md#Notary node module) for
+details on module features.
+
+### AtipicialFs BlockFetcher Configuration
+
+`AtipicialFsBlockFetcher` configuration section contains settings for AtipicialFs
+BlockFetcher module and has the following structure:
+```
+  AtipicialFsBlockFetcher:
+    Enabled: true
+    UnlockWallet:
+      Path: "./wallet.json"
+      Password: "pass"
+    Addresses:
+      - st1.storage.fs.atipicial.org:8080
+      - st2.storage.fs.atipicial.org:8080
+      - st3.storage.fs.atipicial.org:8080
+      - st4.storage.fs.atipicial.org:8080
+    Timeout: 10m
+    DownloaderWorkersCount: 500
+    OIDBatchSize: 8000
+    BQueueSize: 16000
+    ContainerID: "7a1cn9LNmAcHjESKWxRGG7RSZ55YHJF6z2xDLTCuTZ6c"
+    BlockAttribute: "Block"
+```
+where:
+- `Enabled` enables AtipicialFs BlockFetcher module.
+- `UnlockWallet` contains wallet settings to retrieve account to sign requests to
+  AtipicialFs. Without this setting, the module will use randomly generated private key.
+  For configuration details see [Unlock Wallet Configuration](#Unlock-Wallet-Configuration)
+- `Addresses` is a list of AtipicialFs storage nodes addresses. This parameter is required.
+- `Timeout` is a timeout for a single request to AtipicialFs storage node (10 minutes by
+  default).
+- `ContainerID` is a container ID to fetch blocks from. This parameter is required.
+- `BlockAttribute` is an attribute name of AtipicialFs object that contains block
+  data. It's set to `Block` by default.
+- `DownloaderWorkersCount` is a number of workers that download blocks from
+  AtipicialFs in parallel (500 by default).
+- `OIDBatchSize` is the number of blocks to search per a single request to AtipicialFs
+  in case of disabled index files search. Also, for both modes of BlockFetcher
+  operation this setting manages the buffer size of OIDs and blocks transferring
+  channels. By default, it's set to a half of `BQueueSize` parameter.
+- `BQueueSize` is a size of the block queue used to manage consecutive blocks
+  addition to the chain. It must be larger than `OIDBatchSize` and highly recommended
+  to be `2*OIDBatchSize` or `3*OIDBatchSize`. By default, it's set to 16000.
+
+### AtipicialFs StateFetcher Configuration
+
+`AtipicialFsStateFetcher` configuration section contains settings for AtipicialFs
+StateFetcher module and has the following structure:
+```
+  AtipicialFsStateFetcher:
+    Enabled: true
+    UnlockWallet:
+      Path: "./wallet.json"
+      Password: "pass"
+    Addresses:
+      - st1.storage.fs.atipicial.org:8080
+      - st2.storage.fs.atipicial.org:8080
+      - st3.storage.fs.atipicial.org:8080
+      - st4.storage.fs.atipicial.org:8080
+    Timeout: 10m
+    ContainerID: "7a1cn9LNmAcHjESKWxRGG7RSZ55YHJF6z2xDLTCuTZ6c"
+    StateAttribute: "State"
+    KeyValueBatchSize: 1000
+```
+where:
+- `Enabled` enables AtipicialFs StateFetcher module.
+- `UnlockWallet` contains wallet settings to retrieve account to sign requests to
+  AtipicialFs. Without this setting, the module will use randomly generated private key.
+  For configuration details see [Unlock Wallet Configuration](#Unlock-Wallet-Configuration).
+- `Addresses` is a list of AtipicialFs storage nodes addresses. If not specified, the
+  `Addresses` will be taken from the `AtipicialFsBlockFetcher` configuration section.
+- `Timeout` is a timeout for a single request to AtipicialFs storage node (10 minutes by
+  default).
+- `ContainerID` is a container ID to fetch contract storage data from. If not 
+  specified, the container ID will be taken from the `AtipicialFsBlockFetcher` 
+  configuration section.
+- `StateAttribute` is an attribute name of AtipicialFs object that contains state
+  data. It's set to `State` by default.
+- `KeyValueBatchSize` is the number of key value pairs to be processed and flushed 
+  to the storage at once. By default, it's set to 1000.
+
+`StateSyncInterval` protocol configuration value specifies the block height interval 
+between consecutive state objects in the AtipicialFs container. By default, it's set to 
+40000, see the [StateSyncInterval configuration section](#Protocol-Configuration).
+
+If `AtipicialFsStateFetcher` section is not specified and `AtipicialFsStateSyncExtensions` is
+`true`, then [AtipicialFs StateFetcher Configuration](#AtipicialFs-StateFetcher-Configuration)
+module configuration will be used.
+
+### Pprof Configuration
+
+Pprof basic setup (enabled/addresses follows the same structure used by
+[Prometheus](#Prometheus-Metrics-Service-Configuration), however it has two
+additional boolean fields:
+```
+Pprof:
+  Enabled: false
+  EnableBlock: false
+  EnableMutex: false
+  Addresses:
+    - ":30001"
+```
+where:
+- `EnableBlock` turns on routine block profiling which can affect performance.
+- `EnableMutex` turns on mutex profiling which can affect performance.
+
+### Prometheus Metrics Service Configuration
+
+Metrics service configuration describes options for Prometheus and has the
+following structure:
+```
+Prometheus:
+  Enabled: false
+  Addresses:
+    - ":40001"
+```
+where:
+- `Enabled` denotes whether the service is enabled.
+- `Addresses` is a list of service addresses to be running at and listen to in
+   the form of "host:port".
+
+### RPC Configuration
+
+`RPC` configuration section describes settings for the RPC server and has
+the following structure:
+```
+RPC:
+  Enabled: true
+  Addresses:
+    - ":10332"
+  DirectRelay: false
+  EnableCORSWorkaround: false
+  MaxGasInvoke: 50
+  MaxIteratorResultItems: 100
+  MaxFindResultItems: 100
+  MaxFindStoragePageSize: 50
+  MaxAEP11Tokens: 100
+  MaxRequestBodyBytes: 5242880
+  MaxRequestHeaderBytes: 1048576
+  MaxWebSocketClients: 64
+  MaxWebSocketFeeds: 16
+  MempoolSubscriptionsEnabled: false
+  SessionEnabled: false
+  SessionExpansionEnabled: false
+  SessionLifetime: 15s
+  SessionBackedByMPT: false
+  SessionPoolSize: 20
+  StartWhenSynchronized: false
+  TLSConfig:
+    Addresses:
+      - ":10331"
+    CertFile: serv.crt
+    Enabled: true
+    KeyFile: serv.key
+```
+where:
+- `Enabled` denotes whether an RPC server should be started.
+- `Addresses` is a list of RPC server addresses to be running at and listen to in
+  the form of "host:port".
+- `DirectRelay` (`bool`) denotes whether the node should relay the full transaction
+  (instead of its hash) to the peers. Applicable only to those transactions that are
+  assumedly new to the network (submitted via `sendrawtransaction` RPC call).
+- `EnableCORSWorkaround` turns on a set of origin-related behaviors that make
+  RPC server wide open for connections from any origins. It enables OPTIONS
+  request handling for pre-flight CORS and makes the server send
+  `Access-Control-Allow-Origin` and `Access-Control-Allow-Headers` headers for
+  regular HTTP requests (allowing any origin which effectively makes CORS
+  useless). It also makes websocket connections work for any `Origin`
+  specified in the request header. This option is not recommended (reverse
+  proxy can be used to have proper app-specific CORS settings), but it's an
+  easy way to make RPC interface accessible from the browser.
+- `MaxGasInvoke` is the maximum GAS allowed to spend during `invokefunction` and
+  `invokescript` RPC-calls. `calculatenetworkfee` also can't exceed this GAS amount
+  (normally the limit for it is MaxVerificationGAS from Policy, but if MaxGasInvoke
+  is lower than that then this limit is respected).
+- `MaxIteratorResultItems` - maximum number of elements extracted from iterator
+   returned by `invoke*` call in cases if `SessionEnabled` is false or
+  `SessionExpansionEnabled` is true. When the `MaxIteratorResultItems` value is
+  set to `n`, only `n` iterations are returned and truncated is true (if
+  `SessionEnabled` is false, see `SessionEnabled` setting), indicating that
+   there is still data to be returned.
+- `MaxFindResultItems` - the maximum number of elements for `findstates` response.
+- `MaxFindStoragePageSize` - the maximum number of elements for `findstorage` response per single page.
+- `MaxAEP11Tokens` - limit for the number of tokens returned from
+  `getaep11balances` call.
+- `MaxRequestBodyBytes` - the maximum allowed HTTP request body size in bytes
+  (5MB by default).
+- `MaxRequestHeaderBytes` - the maximum allowed HTTP request header size in bytes
+  (1MB by default).
+- `MaxWebSocketClients` - the maximum simultaatipicialus websocket client connection
+  number (64 by default). Attempts to establish additional connections will
+  lead to websocket handshake failures. Use "-1" to disable websocket
+  connections (0 will lead to using the default value).
+- `MaxWebSocketFeeds` -- the maximum simultaatipicialus event subscriptions number
+  for a single client (16 by default). Attempts to create additional subscriptions
+  will lead to error.
+- `MempoolSubscriptionsEnabled` - denotes whether JSON-RPC websocket subscription
+  for mempool events is enabled. If not set, a call to `subscribe` JSON-RPC handler
+  with `mempool_event` argument will return an error. Defaults to false, to avoid
+  running the subscriptions dispatcher, as it can noticeably affect the node's
+  performance. It is not recommended to enable this extension on consensus nodes.
+- `SessionEnabled` denotes whether session-based iterator JSON-RPC API is enabled.
+  If true, then all iterators got from `invoke*` calls will be stored as sessions
+  on the server side available for further traverse. `traverseiterator` and
+  `terminatesession` JSON-RPC calls will be handled by the server. It is not
+  recommended to enable this setting for public RPC servers due to possible DoS
+  attack. Set to `false` by default. If `false` or `SessionExpansionEnabled`,
+  iterators are expanded into a set of values (see `MaxIteratorResultItems` and
+  `SessionExpansionEnabled` settings). Implementation note: when BoltDB storage
+  is used as a node backend DB, then enabling iterator sessions may cause
+  blockchain persist delays up to 2*`SessionLifetime` on early blockchain
+  lifetime stages with relatively small DB size. It can happen due to BoltDB
+  re-mmapping behaviour traits. If regular persist is a critical requirement,
+  then we recommend either to decrease `SessionLifetime` or to enable
+  `SessionBackedByMPT`, see `SessionBackedByMPT` documentation for more
+  details.
+- `SessionExpansionEnabled` enables partial expansion of iterators returned by 
+  `invoke*` calls. When enabled, the server returns up to `MaxIteratorResultItems`
+  values from the iterator in the initial response. If more items are available, 
+  the result is marked as truncated (if `SessionEnabled` is false). When
+  `SessionEnabled` is also true, the remaining iterator state (if so) is stored
+  in a session, allowing further traversal via `traverseiterator`; iterator ID
+  field remains empty for cases when the iterator doesn't have more items after
+  expansion. If disabled, iterators are either expanded up to
+  `MaxIteratorResultItems` or require explicit traversal via session-based
+  calls. By default, `SessionExpansionEnabled` is set to `false`.
+- `SessionLifetime` (`Duration`) is a lifetime of iterator session. It is set to
+  `TimePerBlock` seconds (but not less than 5s) by default and is relevant
+  only if `SessionEnabled` is set to `true`.
+- `SessionBackedByMPT` is a flag forcing JSON-RPC server into using MPT-backed
+  storage for delayed iterator traversal. If `true`, then iterator resources got
+  after `invoke*` calls will be released immediately. Further iterator traversing
+  will be performed using MPT-backed storage by retrieving iterator via historical
+  MPT-provided `invoke*` recall. `SessionBackedByMPT` set to `true` strongly affects
+  the `traverseiterator` call performance and doesn't allow iterator traversing
+  for outdated or removed states (see `KeepOnlyLatestState` and
+  `RemoveUntraceableBlocks` settings documentation for details), thus, it is not
+  recommended to enable `SessionBackedByMPT` needlessly. `SessionBackedByMPT` is
+  set to `false` by default and is relevant only if `SessionEnabled` is set to
+  `true`.
+- `SessionPoolSize` is the maximum number of concurrent iterator sessions. It is
+  set to `20` by default. If the subsequent session can't be added to the session
+  pool, then invocation result will contain corresponding error inside the
+  `FaultException` field.
+- `StartWhenSynchronized` controls when RPC server will be started, by default
+  (`false` setting) it's started immediately and RPC is available during node
+  synchronization. Setting it to `true` will make the node start RPC service only
+  after full synchronization.
+- `TLS` section configures TLS protocol.
+
+### State Root Configuration
+
+`StateRoot` configuration section contains settings for state roots exchange and has
+the following structure:
+```
+StateRoot:
+  Enabled: false
+  UnlockWallet:
+    Path: "./wallet.json"
+    Password: "pass"
+```
+where:
+- `Enabled` enables state root module.
+- `UnlockWallet` contains wallet settings, see
+  [Unlock Wallet Configuration](#Unlock-Wallet-Configuration) section for
+  structure details.
+
+### Consensus Configuration
+
+`Consensus` configuration section describes configuration for dBFT node
+module and has the following structure:
+```
+Consensus:
+  Enabled: false
+  UnlockWallet:
+    Path: "/consensus_node_wallet.json"
+    Password: "pass"
+```
+where:
+- `Enabled` denotes whether dBFT module is active.
+- `UnlockWallet` is a consensus node wallet configuration, see the
+  [Unlock Wallet Configuration](#Unlock-Wallet-Configuration) section for
+  structure details.
+
+Please, refer to the [consensus node documentation](./consensus.md) for more
+details on consensus node setup.
+
+### Unlock Wallet Configuration
+
+`UnlockWallet` configuration section contains wallet settings and has the following
+structure:
+```
+UnlockWallet:
+  Path: "./wallet.json"
+  Password: "pass"
+```
+where:
+- `Path` is a path to wallet.
+- `Password` is a wallet password.
+
+## Protocol Configuration
+
+`ProtocolConfiguration` section of `yaml` node configuration file contains
+protocol-related settings described in the table below.
+
+| Section | Type | Default value | Description | Notes |
+| --- | --- | --- | --- | --- |
+| CommitteeHistory | map[uint32]uint32 | none | Number of committee members after the given height, for example `{0: 1, 20: 4}` sets up a chain with one committee member since the genesis and then changes the setting to 4 committee members at the height of 20. `StandbyCommittee` committee setting must have the number of keys equal or exceeding the highest value in this option. Blocks numbers where the change happens must be divisible by the old and by the new values simultaatipicialusly. If not set, committee size is derived from the `StandbyCommittee` setting and never changes. |
+| Genesis | [Genesis](#Genesis-Configuration) | none | The set of genesis block settings including AtipicialGo-specific protocol extensions that should be enabled at the genesis block or during native contracts initialisation. |
+| Hardforks | `map[string]uint32` | [] | The set of incompatible changes that affect node behaviour starting from the specified height. The default value is an empty set which should be interpreted as "each known stable hard-fork is applied from the zero blockchain height". See [Hardforks](#Hardforks) section for a list of supported keys. |
+| Magic | `uint32` | `0` | Magic number which uniquely identifies Atipicial network. |
+| MaxBlockSize | `uint32` | `262144` | Maximum block size in bytes. |
+| MaxBlockSystemFee | `int64` | `150000000000` | Maximum overall transactions system fee per block. Applied at consensus level and for mempool transactions filtering only. |
+| MaxTraceableBlocks | `uint32` | `2102400` | Length of the chain accessible to smart contracts. This setting is replaced by [`Genesis`-level](#Genesis-Configuration) `MaxTraceableBlocks` protocol configuration setting and corresponding Policy value starting from `Echidna` hardfork. |
+| MaxTransactionsPerBlock | `uint16` | `512` | Maximum number of transactions per block. |
+| MaxValidUntilBlockIncrement | `uint32` | `5760` | Upper height increment limit for transaction's ValidUntilBlock field value relative to the current blockchain height, exceeding which a transaction will fail validation. It is set to estimated daily number of blocks with 15s interval by default. This setting is replaced by [`Genesis`-level](#Genesis-Configuration) `MaxValidUntilBlockIncrement` protocol configuration setting and corresponding Policy value starting from `Echidna` hardfork. |
+| MemPoolSize | `int` | `50000` | Size of the node's memory pool where transactions are stored before they are added to block. |
+| P2PNotaryRequestPayloadPoolSize | `int` | `1000` | Size of the node's P2P Notary request payloads memory pool where P2P Notary requests are stored before main or fallback transaction is completed and added to the chain.<br>This option is valid only if `P2PSigExtensions` are enabled. | Not supported by the C# node, thus may affect heterogeatipicialus networks functionality. |
+| P2PSigExtensions | `bool` | `false` | Enables following additional Notary service related logic:<br>• Network payload of the `P2PNotaryRequest` type<br>• Notary node module | Not supported by the C# node, thus may affect heterogeatipicialus networks functionality. |
+| P2PStateExchangeExtensions | `bool` | `false` | Enables the following P2P MPT state data exchange logic: <br>• `StateSyncInterval` protocol setting <br>• P2P commands `GetMPTDataCMD` and `MPTDataCMD` | Not supported by the C# node, thus may affect heterogeatipicialus networks functionality. Can be supported either on MPT-complete node (`KeepOnlyLatestState`=`false`) or on light GC-enabled node (`RemoveUntraceableBlocks=true`) in which case `KeepOnlyLatestState` setting doesn't change the behavior, an appropriate set of MPTs is always stored (see `RemoveUntraceableBlocks`). |
+| AtipicialFsStateSyncExtensions | `bool` | `false` | Enables light node synchronization based on snapshots stored in AtipicialFs | Not supported by the C# node, thus may affect heterogeatipicialus networks functionality. Can be supported either on MPT-complete node (`KeepOnlyLatestState`=`false`) or on light GC-enabled node (`RemoveUntraceableBlocks=true`) in which case `KeepOnlyLatestState` setting doesn't change the behavior, an appropriate set of MPTs is always stored (see `RemoveUntraceableBlocks`). If `AtipicialFsStateSyncExtensions` is enabled, it is required to configure the AtipicialFsBlockFetcher and AtipicialFsStateFetcher services, which are responsible for fetching blocks and state data for AtipicialFs-based synchronization. If `StateRootInHeader` is enabled the container can be fully trusted. |
+| ReservedAttributes | `bool` | `false` | Allows to have reserved attributes range for experimental or private purposes. |
+| SeedList | `[]string` | [] | List of initial nodes addresses used to establish connectivity. |
+| StandbyCommittee | `[]string` | [] | List of public keys of standby committee validators are chosen from. | The list of keys is not required to be sorted, but it must be exactly the same within the configuration files of all the nodes in the network. |
+| StateRootInHeader | `bool` | `false` | Enables storing state root in block header. | Experimental protocol extension! |
+| StateSyncInterval | `int` | `40000` | The number of blocks between state heights available for MPT state data synchronization. | `P2PStateExchangeExtensions` should be enabled to use this setting. |
+| TimePerBlock | `Duration` | `15s` | Minimal (and targeted for) time interval between blocks if MaxTimePerBlock is not set. Sub-milliseconds precision is not supported. This setting is replaced by [`Genesis`-level](#Genesis-Configuration) `TimePerBlock` protocol configuration setting and corresponding Policy value starting from `Echidna` hardfork. |
+| MaxTimePerBlock | `Duration` | `0s` | Maximum (and targeted for) time interval between blocks for cases when there's no transactions in the node's memory pool. Sub-milliseconds precision is not supported. If set, time interval between blocks will vary from TimePerBlock (when there are some transactions in the network) and MaxTimePerBlock. | An extension of AtipicialGo node that enables dynamic block time as described in https://github.com/atipicial-project/atipicial/issues/4018. |
+| ValidatorsCount | `uint32` | `0` | Number of validators set for the whole network lifetime, can't be set if `ValidatorsHistory` setting is used. |
+| ValidatorsHistory | map[uint32]uint32 | none | Number of consensus nodes to use after given height (see `CommitteeHistory` also). Heights where the change occurs must be divisible by the number of committee members at that height. Can't be used with `ValidatorsCount` not equal to zero. Initial validators count for genesis block must always be specified. |
+| VerifyTransactions | `bool` | `false` | Denotes whether to verify transactions in the received blocks. |
+
+### Genesis Configuration
+
+`Genesis` subsection of protocol configuration section contains a set of settings
+specific for genesis block including AtipicialGo node extensions that should be enabled
+during genesis block persist or at the moment of native contracts initialisation.
+This subsection also contains initial values used for native Policy contract storage
+initialisation at Echidna hardfork. `Genesis` has the following structure:
+```
+Genesis:
+  MaxTraceableBlocks: 2102400
+  MaxValidUntilBlockIncrement: 5760
+  Roles:
+    AtipicialFsAlphabet:
+      - 033238fa63bd08115ebf442d4af897eea2f6866e4c2001cd1f6e7656acdd91a5d3
+      - 03b209fd4f53a7170ea4444e0cb0a6bb6a53c2bd016926989cf85f9b0fba17a70c
+      - 02aaec38470f6aad0042c6e877cfd8087d2676b0f516fddd362801b9bd3936399e
+      - 03c6aa6e12638b36e88adc1ccdceac4db9929575c3e03576c617c49cce7114a050
+    Oracle:
+      - 03409f31f0d66bdc2f70a9730b66fe186658f84a8018204db01c106edc36553cd0
+      - 0222038884bbd1d8ff109ed3bdef3542e768eef76c1247aea8bc8171f532928c30
+  TimePerBlock: 15s
+  Transaction:
+    Script: "DCECEDp/fdAWVYWX95YNJ8UWpDlP2Wi55lFV60sBPkBAQG5BVuezJw=="
+    SystemFee: 100000000
+```
+where:
+- `MaxTraceableBlocks` is the length of the chain tail accessible to smart contracts.
+  This setting is used to initialize `MaxTraceableBlocks` value of native Policy contract
+  at `Echidna` hardfork. If not set, then `ProtocolConfiguration`-level
+  `MaxTraceableBlocks` setting is used as the default value.
+
+  Note that this value is stored directly in the Policy contract storage, i.e. it
+  affects the chain's state, so it's important to keep it the same on all nodes
+  in frames of a single network.
+
+- `MaxValidUntilBlockIncrement` is an upper height increment limit for transaction's
+  ValidUntilBlock field value relative to the current blockchain height, exceeding
+  which a transaction will fail validation. This setting is used to initialize
+  `MaxValidUntilBlockIncrement` value of native Policy contract at `Echidna`
+  hardfork. If not set, then `ProtocolConfiguration`-level
+  `MaxValidUntilBlockIncrement` setting is used as the default value.
+
+  Note that this value is stored directly in the Policy contract storage, i.e. it
+  affects the chain's state, so it's important to keep it the same on all nodes
+  in frames of a single network.
+
+- `Roles` is a map from node roles that should be set at the moment of native
+  RoleManagement contract initialisation to the list of hex-encoded public keys
+  corresponding to this role. The set of valid roles includes:
+  - `StateValidator`
+  - `Oracle`
+  - `AtipicialFsAlphabet`
+  - `P2PNotary`
+  
+  Roles designation order follows the enumeration above. Designation
+  notifications will be emitted after each configured role designation.
+  
+  Note that Roles is a AtipicialGo extension that isn't supported by the AtipicialC# node and
+  must be disabled on the public Atipicial  networks. Roles extension is compatible
+  with Hardforks setting, which means that specified roles will be set
+  only during native RoleManagement contract initialisation (which may be
+  performed in some non-genesis hardfork). By default, no roles are designated.
+
+- `TimePerBlock` is a minimal (and targeted for) time interval between blocks.
+  It has the `Duration` type. Sub-milliseconds precision is not supported. This
+  setting is used to initialize `MillisecondsPerBlock` value of native Policy contract at
+  `Echidna` hardfork. If not set, then `ProtocolConfiguration`-level `TimePerBlock`
+  setting is used as the default value.
+
+  Note that this value is stored directly in the Policy contract storage, i.e. it
+  affects the chain's state, so it's important to keep it the same on all nodes
+  in frames of a single network.
+
+- `Transaction` is a container for transaction script that should be deployed in
+  the genesis block if provided. `Transaction` includes `Script` which is a
+  base64-encoded transaction script and `SystemFee` which is a transaction's
+  system fee value (in GAS) that will be spent during transaction execution.
+  Transaction generated from the provided parameters has two signers at max with
+  CalledByEntry witness scope: the first one is standby validators multisignature
+  signer and the second one (if differs from the first) is committee
+  multisignature signer.
+
+  Note that `Transaction` is a AtipicialGo extension that isn't supported by the AtipicialC#
+  node and must be disabled on the public Atipicial  networks.
+
+### Hardforks
+
+The latest stable hardfork as per 0.121.0 release is Gorgon. Huyao is still
+in development and can change in an incompatible way.
+
+| Name            | Changes | References |
+| --- | --- | --- |
+| `Aspidochelone` | Adjusts the price of `System.Contract.CreateStandardAccount` and `System.Contract.CreateMultisigAccount` interops so that the resulting prices are in accordance with `sha256` method of native `CryptoLib` contract. Also adjusts the price of `System.Runtime.GetRandom` interop and fixes its vulnerability. A special AtipicialGo-specific change is included as well for ContractManagement's update/deploy call flags behaviour to be compatible with pre-0.99.0 behaviour that was changed because of the 3.2.0 protocol change | https://github.com/atipicial/atipicial-go/pull/2469 <br> https://github.com/atipicial-project/atipicial/pull/2712 <br> https://github.com/atipicial/atipicial-go/pull/2519 <br> https://github.com/atipicial-project/atipicial/pull/2749 <br> https://github.com/atipicial-project/atipicial/pull/2653 |
+| `Basilisk`      | Enables strict smart contract script check against a set of JMP instructions and against method boundaries enabled on contract deploy or update. Increased `stackitem.Integer` JSON parsing precision up to the maximum value supported by the AtipicialVM (but this was disabled since C# is not completely fixed yet). Enables strict check for notifications emitted by a contract to precisely match the events specified in the contract manifest. | https://github.com/atipicial/atipicial-go/pull/3056 <br> https://github.com/atipicial-project/atipicial/pull/2881 <br> https://github.com/atipicial/atipicial-go/pull/3080 <br> https://github.com/atipicial-project/atipicial/pull/2883 <br> https://github.com/atipicial/atipicial-go/pull/3085 <br> https://github.com/atipicial-project/atipicial/pull/2810 |
+| `Cockatrice`    | Introduces the ability to update native contracts. Includes a couple of new native smart contract APIs: `keccak256` of native CryptoLib contract and `getCommitteeAddress` of native AtipicialCoin contract. | https://github.com/atipicial/atipicial-go/pull/3402 <br> https://github.com/atipicial-project/atipicial/pull/2942 <br> https://github.com/atipicial/atipicial-go/pull/3301 <br> https://github.com/atipicial-project/atipicial/pull/2925 <br> https://github.com/atipicial/atipicial-go/pull/3362 <br> https://github.com/atipicial-project/atipicial/pull/3154 <br> https://github.com/atipicial-project/atipicial/issues/4583 |
+| `Domovoi`       | Makes node use executing contract state for the contract call permissions check instead of the state stored in the native Management contract. In C# also makes System.Runtime.GetNotifications interop properly count stack references of notification parameters which prevents users from creating objects that exceed MaxStackSize constraint, but AtipicialGo has never had this bug, thus proper behaviour is preserved even before HFDomovoi. It results in the fact that some T5 testnet transactions have different ApplicationLogs compared to the C# node, but the node states match. | https://github.com/atipicial/atipicial-go/pull/3476 <br> https://github.com/atipicial-project/atipicial/pull/3290 <br> https://github.com/atipicial/atipicial-go/pull/3473 <br> https://github.com/atipicial-project/atipicial/pull/3290 <br> https://github.com/atipicial-project/atipicial/pull/3301 <br> https://github.com/atipicial/atipicial-go/pull/3485 |
+| `Echidna`       | Introduces `Designation` event extension with `Old` and `New` roles data to native RoleManagement contract. Adds support for `base64UrlEncode` and `base64UrlDecode` methods to native StdLib contract. Extends the list of required call flags for `registerCandidate`, `unregisterCandidate`and `vote` methods of native AtipicialCoin contract with AllowNotify flag. Enables `onAEP17Payment` method of ATC contract for candidate registration. Introduces constraint for maximum number of execution notifications. Adds support for `recoverSecp256K1` method of native CryptoLib contract. Introduces `setMillisecondsPerBlock` and `getMillisecondsPerBlock` methods of native Policy contract. Introduces support for NotaryAssisted transaction attribute and native Notary contract. | https://github.com/atipicial/atipicial-go/pull/3554 <br> https://github.com/atipicial/atipicial-go/pull/3761 <br> https://github.com/atipicial/atipicial-go/pull/3554 <br> https://github.com/atipicial-project/atipicial/pull/3597 <br> https://github.com/atipicial/atipicial-go/pull/3700 <br> https://github.com/atipicial/atipicial-go/pull/3640 <br> https://github.com/atipicial-project/atipicial/pull/3548 <br> https://github.com/atipicial/atipicial-go/pull/3863 <br> https://github.com/atipicial-project/atipicial/pull/3696 <br> https://github.com/atipicial-project/atipicial/pull/3895 <br> https://github.com/atipicial/atipicial-go/pull/3835 <br> https://github.com/atipicial/atipicial-go/pull/3854 <br> https://github.com/atipicial-project/atipicial/pull/3175 <br> https://github.com/atipicial/atipicial-go/pull/3478 <br> https://github.com/atipicial-project/atipicial/pull/3178 |
+| `Faun`          | Adds `getBlockedAccounts` method to native Policy contract. Adds `hexEncode` and `hexDecode` methods to native StdLib contract. Adds `getExecPicoFeeFactor` method to native Policy contract and enables 4 decimals for execution fee factor. Adds whitelist fee contract management to native Policy contract: `setWhitelistFeeContract`, `removeWhitelistFeeContract`, `getWhitelistFeeContracts` methods and `WhitelistFeeChanged` event. Adds funds recovery mechanism to native Policy contract: `recoverFund` method and `RecoveredFund` event. | https://github.com/atipicial/atipicial-go/pull/3932 <br> https://github.com/atipicial/atipicial-go/pull/4004 <br> https://github.com/atipicial-project/atipicial/pull/4147 <br> https://github.com/atipicial-project/atipicial/pull/4150 <br> https://github.com/atipicial/atipicial-go/pull/4057 <br> https://github.com/atipicial-project/atipicial/pull/4278 <br> https://github.com/atipicial/atipicial-go/pull/4052 <br> https://github.com/atipicial-project/atipicial/pull/4201 <br> https://github.com/atipicial/atipicial-go/pull/4139 <br> https://github.com/atipicial-project/atipicial/pull/4328 |
+| `Gorgon`        | Fixes `SHR` and `SHL` VM opcode handlers for the case of zero shift. Adds bounds check for index of HASKEY VM opcode. Introduces panic on invalid signature/public key length for CryptoLib's `verifyWithECDsa` and `verifyWithEd25519` methods and `System.Crypto.CheckSig` and `System.Crypto.CheckMultisig` interops. Changes the order of contract's account block and contract's hash/storage erasure during native ContractManagement's `destroy` processing. | https://github.com/atipicial/atipicial-go/pull/4197 <br> https://github.com/atipicial-project/atipicial/pull/4516 <br> https://github.com/atipicial/atipicial-go/pull/4197 <br> https://github.com/atipicial/atipicial-go/pull/4197 <br> https://github.com/atipicial-project/atipicial/pull/4449 <br> https://github.com/atipicial/atipicial-go/pull/4236 <br> https://github.com/atipicial-project/atipicial/pull/4539 <br> https://github.com/atipicial/atipicial-go/pull/4233 |
+| `Huyao`         | The latest unstable hardfork, doesn't introduce new functionality yet. | https://github.com/atipicial/atipicial-go/pull/4330 <br> https://github.com/atipicial-project/atipicial/pull/4571 |
+
+## DB compatibility
+
+Real networks with large number of blocks require a substantial amount of time
+to synchronize. When operating a number of node instances with similar
+configurations you may want to save some resources by performing synchronization
+on one node and then copying the DB over to other instances. In general, this
+can be done and this is supported, but AtipicialGo has a lot of options that may
+affect this:
+- any differences in `ProtocolConfiguration` section make (or may make) databases
+  incompatible, except for `MemPoolSize`, `P2PNotaryRequestPayloadPoolSize`,
+  `SeedList`, `TimePerBlock`.
+  Protocol configuration is expected to be the same on all nodes of the same
+  network, so don't touch it unless you know what you're doing.
+- DB types (Level/Bolt) must be the same
+- `GarbageCollectionPeriod` must be the same
+- `KeepOnlyLatestState` must be the same
+- `RemoveUntraceableBlocks` must be the same
+- `SaveInvocations` must be the same
+
+BotlDB is also known to be incompatible between machines with different
+endianness. Nothing is known for LevelDB wrt this, so it's not recommended
+to copy it this way too.

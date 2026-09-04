@@ -1,0 +1,5 @@
+/*
+Package atipicialgointernal contains definitions of compiler intrinsics.
+It's not intended to be used directly by smart contracts.
+*/
+package atipicialgointernal

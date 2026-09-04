@@ -1,0 +1,57 @@
+package util
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/atipicial/atipicial-go/cli/options"
+	"github.com/atipicial/atipicial-go/cli/paramcontext"
+	"github.com/atipicial/atipicial-go/cli/query"
+	"github.com/atipicial/atipicial-go/pkg/core/transaction"
+	"github.com/urfave/cli/v2"
+)
+
+func txDump(ctx *cli.Context) error {
+	args := ctx.Args().Slice()
+	if len(args) == 0 {
+		return cli.Exit("missing input file", 1)
+	} else if len(args) > 1 {
+		return cli.Exit("only one input file is accepted", 1)
+	}
+
+	c, err := paramcontext.Read(args[0])
+	if err != nil {
+		return cli.Exit(err, 1)
+	}
+
+	tx, ok := c.Verifiable.(*transaction.Transaction)
+	if !ok {
+		return cli.Exit("verifiable item is not a transaction", 1)
+	}
+
+	err = query.DumpApplicationLog(ctx, nil, tx, nil, true)
+	if err != nil {
+		return cli.Exit(err, 1)
+	}
+
+	if ctx.String(options.RPCEndpointFlag) != "" {
+		gctx, cancel := options.GetTimeoutContext(ctx)
+		defer cancel()
+
+		var err error
+		cl, err := options.GetRPCClient(gctx, ctx)
+		if err != nil {
+			return cli.Exit(err, 1)
+		}
+		res, err := cl.InvokeScript(tx.Script, tx.Signers)
+		if err != nil {
+			return cli.Exit(err, 1)
+		}
+		resS, err := json.MarshalIndent(res, "", " ")
+		if err != nil {
+			return cli.Exit(err, 1)
+		}
+		fmt.Fprintln(ctx.App.Writer, string(resS))
+	}
+	return nil
+}

@@ -1,0 +1,4 @@
+name: "Policy helper contract"
+sourceurl: https://github.com/atipicial/atipicial-go
+supportedstandards: []
+safemethods: ["do"]

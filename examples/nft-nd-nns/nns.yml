@@ -1,0 +1,21 @@
+name: "NameService"
+sourceurl: https://github.com/atipicial/atipicial-go/
+supportedstandards: ["AEP-11", "AEP-22", "AEP-29"]
+safemethods: ["balanceOf", "decimals", "symbol", "totalSupply", "tokensOf", "ownerOf",
+              "tokens", "properties", "roots", "getPrice", "isAvailable", "getRecord",
+              "resolve", "getAllRecords"]
+events:
+  - name: Transfer
+    parameters:
+      - name: from
+        type: Hash160
+      - name: to
+        type: Hash160
+      - name: amount
+        type: Integer
+      - name: tokenId
+        type: ByteArray
+permissions:
+  - hash: fffdc93764dbaddd97c48f252a53ea4643faa3fd
+    methods: ["update"]
+  - methods: ["onAEP11Payment"]

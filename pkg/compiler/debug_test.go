@@ -1,0 +1,576 @@
+package compiler
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/atipicial/atipicial-go/internal/testserdes"
+	"github.com/atipicial/atipicial-go/pkg/smartcontract"
+	"github.com/atipicial/atipicial-go/pkg/smartcontract/binding"
+	"github.com/atipicial/atipicial-go/pkg/smartcontract/manifest"
+	"github.com/atipicial/atipicial-go/pkg/vm/opcode"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCodeGen_DebugInfo(t *testing.T) {
+	src := `package foo
+	import "github.com/atipicial/atipicial-go/pkg/interop"
+	import "github.com/atipicial/atipicial-go/pkg/interop/storage"
+	import "github.com/atipicial/atipicial-go/pkg/interop/native/ledger"
+	import "github.com/atipicial/atipicial-go/pkg/interop/runtime"
+var staticVar int
+func init() {
+	a := 1
+	_ = a
+}
+func init() {
+	x := ""
+	_ = x
+	staticVar = 1
+}
+func Main(op string) bool {
+	var s string
+	_ = s
+	res := MethodInt(op)
+	_ = MethodString()
+	_ = MethodByteArray()
+	_ = MethodArray()
+	_ = MethodStruct()
+	_ = MethodConcat("a", "b", "c")
+	_ = unexportedMethod()
+	MethodNotify(nil)
+	return res == 42
+}
+
+func MethodNotify(addr interop.Hash160) {
+	runtime.Notify("Notify", addr)
+}
+
+func MethodInt(a string) int {
+	if a == "get42" {
+		return 42
+	}
+	return 3
+}
+func MethodConcat(a, b string, c string) string{
+	return a + b + c
+}
+func MethodString() string { return "" }
+func MethodByteArray() []byte { return nil }
+func MethodArray() []bool { return nil }
+func MethodStruct() struct{} { return struct{}{} }
+func unexportedMethod() int { return 1 }
+func MethodParams(addr interop.Hash160, h interop.Hash256,
+	sig interop.Signature, pub interop.PublicKey,
+	inter interop.Interface,
+	ctx storage.Context, tx ledger.Transaction) bool {
+	return true
+}
+type MyStruct struct {}
+func (ms MyStruct) MethodOnStruct() { }
+func (ms *MyStruct) MethodOnPointerToStruct() { }
+func _deploy(data any, isUpdate bool) { x := 1; _ = x }
+`
+
+	ne, d, err := CompileWithOptions("foo.go", strings.NewReader(src), nil)
+	require.NoError(t, err)
+	require.NotNil(t, d)
+
+	t.Run("return types", func(t *testing.T) {
+		returnTypes := map[string]string{
+			"MethodInt":    "Integer",
+			"MethodConcat": "String",
+			"MethodString": "String", "MethodByteArray": "ByteArray",
+			"MethodArray": "Array", "MethodStruct": "Array",
+			"Main":                    "Boolean",
+			"unexportedMethod":        "Integer",
+			"MethodOnStruct":          "Void",
+			"MethodOnPointerToStruct": "Void",
+			"MethodParams":            "Boolean",
+			"MethodNotify":            "Void",
+			"_deploy":                 "Void",
+			manifest.MethodInit:       "Void",
+		}
+		for i := range d.Methods {
+			name := d.Methods[i].ID
+			assert.Equal(t, returnTypes[name], d.Methods[i].ReturnType)
+		}
+	})
+
+	t.Run("variables", func(t *testing.T) {
+		vars := map[string][]string{
+			"Main":                {"s,String", "res,Integer"},
+			manifest.MethodInit:   {"a,Integer", "x,String"},
+			manifest.MethodDeploy: {"x,Integer"},
+		}
+		for i := range d.Methods {
+			v, ok := vars[d.Methods[i].ID]
+			if ok {
+				require.Equal(t, v, d.Methods[i].Variables)
+			}
+		}
+	})
+
+	t.Run("static variables", func(t *testing.T) {
+		require.Equal(t, []string{"staticVar,Integer"}, d.StaticVariables)
+	})
+
+	t.Run("param types", func(t *testing.T) {
+		paramTypes := map[string][]DebugParam{
+			"_deploy": {
+				{
+					Name:   "data",
+					Type:   "Any",
+					TypeSC: smartcontract.AnyType,
+				},
+				{
+					Name:   "isUpdate",
+					Type:   "Boolean",
+					TypeSC: smartcontract.BoolType,
+				},
+			},
+			"MethodInt": {{
+				Name: "a",
+				Type: "String",
+				RealType: binding.Override{
+					TypeName: "string",
+				},
+				TypeSC: smartcontract.StringType,
+			}},
+			"MethodConcat": {
+				{
+					Name: "a",
+					Type: "String",
+					RealType: binding.Override{
+						TypeName: "string",
+					},
+					TypeSC: smartcontract.StringType,
+				},
+				{
+					Name: "b",
+					Type: "String",
+					RealType: binding.Override{
+						TypeName: "string",
+					},
+					TypeSC: smartcontract.StringType,
+				},
+				{
+					Name: "c",
+					Type: "String",
+					RealType: binding.Override{
+						TypeName: "string",
+					},
+					TypeSC: smartcontract.StringType,
+				},
+			},
+			"Main": {{
+				Name: "op",
+				Type: "String",
+				RealType: binding.Override{
+					TypeName: "string",
+				},
+				TypeSC: smartcontract.StringType,
+			}},
+		}
+		for i := range d.Methods {
+			v, ok := paramTypes[d.Methods[i].ID]
+			if ok {
+				require.Equal(t, v, d.Methods[i].Parameters)
+			}
+		}
+
+		methodParamsTypes := map[string]string{
+			"addr":  "Hash160",
+			"h":     "Hash256",
+			"sig":   "Signature",
+			"pub":   "PublicKey",
+			"inter": "InteropInterface",
+			"ctx":   "InteropInterface",
+			"tx":    "Array",
+		}
+		for i := range d.Methods {
+			if d.Methods[i].ID != "MethodParams" {
+				continue
+			}
+			for _, p := range d.Methods[i].Parameters {
+				require.Equal(t, methodParamsTypes[p.Name], p.Type, "param %s", p.Name)
+			}
+		}
+	})
+
+	t.Run("notify event params", func(t *testing.T) {
+		emitted, ok := d.EmittedEvents["Notify"]
+		require.True(t, ok)
+		require.Len(t, emitted, 1)
+		require.Len(t, emitted[0].Params, 1)
+		require.Equal(t, "Hash160", emitted[0].Params[0].Type)
+	})
+
+	// basic check that last instruction of every method is indeed RET
+	for i := range d.Methods {
+		index := d.Methods[i].Range.End
+		require.True(t, int(index) < len(ne.Script))
+		require.EqualValues(t, opcode.RET, ne.Script[index])
+	}
+
+	t.Run("convert to Manifest", func(t *testing.T) {
+		p := manifest.NewPermission(manifest.PermissionWildcard)
+		p.Methods.Add("randomMethod")
+
+		actual, err := d.ConvertToManifest(&Options{
+			Name:        "MyCTR",
+			SafeMethods: []string{"methodInt", "methodString"},
+			Permissions: []manifest.Permission{*p},
+		})
+		require.NoError(t, err)
+		expected := &manifest.Manifest{
+			Name: "MyCTR",
+			ABI: manifest.ABI{
+				Methods: []manifest.Method{
+					{
+						Name:       manifest.MethodInit,
+						Parameters: []manifest.Parameter{},
+						ReturnType: smartcontract.VoidType,
+					},
+					{
+						Name: "_deploy",
+						Parameters: []manifest.Parameter{
+							manifest.NewParameter("data", smartcontract.AnyType),
+							manifest.NewParameter("isUpdate", smartcontract.BoolType),
+						},
+						ReturnType: smartcontract.VoidType,
+					},
+					{
+						Name: "main",
+						Parameters: []manifest.Parameter{
+							manifest.NewParameter("op", smartcontract.StringType),
+						},
+						ReturnType: smartcontract.BoolType,
+					},
+					{
+						Name: "methodInt",
+						Parameters: []manifest.Parameter{
+							{
+								Name: "a",
+								Type: smartcontract.StringType,
+							},
+						},
+						ReturnType: smartcontract.IntegerType,
+						Safe:       true,
+					},
+					{
+						Name:       "methodString",
+						Parameters: []manifest.Parameter{},
+						ReturnType: smartcontract.StringType,
+						Safe:       true,
+					},
+					{
+						Name:       "methodByteArray",
+						Parameters: []manifest.Parameter{},
+						ReturnType: smartcontract.ByteArrayType,
+					},
+					{
+						Name:       "methodArray",
+						Parameters: []manifest.Parameter{},
+						ReturnType: smartcontract.ArrayType,
+					},
+					{
+						Name:       "methodStruct",
+						Parameters: []manifest.Parameter{},
+						ReturnType: smartcontract.ArrayType,
+					},
+					{
+						Name: "methodConcat",
+						Parameters: []manifest.Parameter{
+							{
+								Name: "a",
+								Type: smartcontract.StringType,
+							},
+							{
+								Name: "b",
+								Type: smartcontract.StringType,
+							},
+							{
+								Name: "c",
+								Type: smartcontract.StringType,
+							},
+						},
+						ReturnType: smartcontract.StringType,
+					},
+					{
+						Name: "methodParams",
+						Parameters: []manifest.Parameter{
+							manifest.NewParameter("addr", smartcontract.Hash160Type),
+							manifest.NewParameter("h", smartcontract.Hash256Type),
+							manifest.NewParameter("sig", smartcontract.SignatureType),
+							manifest.NewParameter("pub", smartcontract.PublicKeyType),
+							manifest.NewParameter("inter", smartcontract.InteropInterfaceType),
+							manifest.NewParameter("ctx", smartcontract.InteropInterfaceType),
+							manifest.NewParameter("tx", smartcontract.ArrayType),
+						},
+						ReturnType: smartcontract.BoolType,
+					},
+					{
+						Name: "methodNotify",
+						Parameters: []manifest.Parameter{
+							manifest.NewParameter("addr", smartcontract.Hash160Type),
+						},
+						ReturnType: smartcontract.VoidType,
+					},
+				},
+				Events: []manifest.Event{},
+			},
+			Groups:      []manifest.Group{},
+			Permissions: []manifest.Permission{*p},
+			Trusts: manifest.WildPermissionDescs{
+				Value: []manifest.PermissionDesc{},
+			},
+			Extra: json.RawMessage("null"),
+		}
+		require.Equal(t, len(expected.ABI.Methods), len(actual.ABI.Methods))
+		for _, exp := range expected.ABI.Methods {
+			md := actual.ABI.GetMethod(exp.Name, len(exp.Parameters))
+			require.NotNil(t, md)
+			require.Equal(t, exp.Name, md.Name)
+			require.Equal(t, exp.Parameters, md.Parameters)
+			require.Equal(t, exp.ReturnType, md.ReturnType)
+			require.Equal(t, exp.Safe, md.Safe)
+		}
+		require.Equal(t, expected.ABI.Events, actual.ABI.Events)
+		require.Equal(t, expected.Groups, actual.Groups)
+		require.Equal(t, expected.Permissions, actual.Permissions)
+		require.Equal(t, expected.Trusts, actual.Trusts)
+		require.Equal(t, expected.Extra, actual.Extra)
+	})
+}
+
+func TestSequencePoint_NoFunctionBody(t *testing.T) {
+	testCases := []struct {
+		name      string
+		src       string
+		expPoints map[string][]DebugSeqPoint
+	}{
+		{
+			name: "if at end of void function",
+			src: `package foo
+				func Main() {
+					if false {
+						_ = 42
+					} else {
+						_ = 42
+					}
+				}
+			`,
+			expPoints: map[string][]DebugSeqPoint{
+				"main": {
+					{Opcode: 3, StartLine: 4, StartCol: 11, EndLine: 4, EndCol: 13},
+					{Opcode: 5, StartLine: 4, StartCol: 7, EndLine: 4, EndCol: 11},
+					{Opcode: 8, StartLine: 6, StartCol: 11, EndLine: 6, EndCol: 13},
+					{Opcode: 10, StartLine: 6, StartCol: 7, EndLine: 6, EndCol: 11},
+				},
+			},
+		},
+		{
+			name: "switch at end of void function",
+			src: `package foo
+				func Main() {
+					switch {
+					case true:
+						_ = 42
+					case false:
+						_ = 42
+					}
+				}
+			`,
+			expPoints: map[string][]DebugSeqPoint{
+				"main": {
+					{Opcode: 6, StartLine: 5, StartCol: 11, EndLine: 5, EndCol: 13},
+					{Opcode: 8, StartLine: 5, StartCol: 7, EndLine: 5, EndCol: 11},
+					{Opcode: 16, StartLine: 7, StartCol: 11, EndLine: 7, EndCol: 13},
+					{Opcode: 18, StartLine: 7, StartCol: 7, EndLine: 7, EndCol: 11},
+				},
+			},
+		},
+		{
+			name: "named return function",
+			src: `package foo
+				func Main() (n int) {
+					if true {
+						n = 42
+					} else {
+						n = -1
+					}
+					return
+				}
+			`,
+			expPoints: map[string][]DebugSeqPoint{
+				"main": {
+					{Opcode: 8, StartLine: 4, StartCol: 11, EndLine: 4, EndCol: 13},
+					{Opcode: 10, StartLine: 4, StartCol: 7, EndLine: 4, EndCol: 11},
+					{Opcode: 13, StartLine: 6, StartCol: 11, EndLine: 6, EndCol: 13},
+					{Opcode: 15, StartLine: 6, StartCol: 7, EndLine: 6, EndCol: 11},
+					{Opcode: 17, StartLine: 8, StartCol: 6, EndLine: 8, EndCol: 12},
+				},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, d, err := CompileWithOptions("foo.go", strings.NewReader(tc.src), nil)
+			require.NoError(t, err)
+			require.NotNil(t, d)
+			require.Len(t, d.Methods, len(tc.expPoints))
+
+			for _, m := range d.Methods {
+				expected, ok := tc.expPoints[m.Name.Name]
+				require.True(t, ok)
+				require.Equal(t, expected, m.SeqPoints)
+			}
+		})
+	}
+}
+
+func TestSequencePoints(t *testing.T) {
+	src := `package foo
+	func Main(op string) bool {
+		if op == "123" {
+			return true
+		}
+		return false
+	}`
+
+	_, d, err := CompileWithOptions("foo.go", strings.NewReader(src), nil)
+	require.NoError(t, err)
+	require.NotNil(t, d)
+
+	require.Equal(t, 1, len(d.Documents))
+	require.True(t, strings.HasSuffix(d.Documents[0], "foo.go"))
+
+	// Main func has 2 return on 4-th and 6-th lines,
+	// so we have 4 sequence points, 2 for return tokens
+	// and 2 for return results.
+	ps := d.Methods[0].SeqPoints
+	expPoints := []DebugSeqPoint{
+		{Opcode: 12, StartLine: 4, StartCol: 11, EndLine: 4, EndCol: 15},
+		{Opcode: 13, StartLine: 4, StartCol: 4, EndLine: 4, EndCol: 10},
+		{Opcode: 14, StartLine: 6, StartCol: 10, EndLine: 6, EndCol: 15},
+		{Opcode: 15, StartLine: 6, StartCol: 3, EndLine: 6, EndCol: 9},
+	}
+	require.Equal(t, expPoints, ps)
+}
+
+func TestDebugInfo_MarshalJSON(t *testing.T) {
+	d := &DebugInfo{
+		Documents: []string{"/path/to/file"},
+		Methods: []MethodDebugInfo{
+			{
+				ID: "id1",
+				Name: DebugMethodName{
+					Namespace: "default",
+					Name:      "method1",
+				},
+				Range: DebugRange{Start: 10, End: 20},
+				Parameters: []DebugParam{
+					{Name: "param1", Type: "Integer"},
+					{Name: "ok", Type: "Boolean"},
+				},
+				ReturnType: "String",
+				Variables:  []string{},
+				SeqPoints: []DebugSeqPoint{
+					{
+						Opcode:    123,
+						Document:  1,
+						StartLine: 2,
+						StartCol:  3,
+						EndLine:   4,
+						EndCol:    5,
+					},
+				},
+			},
+		},
+		Events: []EventDebugInfo{},
+	}
+
+	testserdes.MarshalUnmarshalJSON(t, d, new(DebugInfo))
+}
+
+func TestManifestOverload(t *testing.T) {
+	src := `package foo
+	func Main() int {
+		return 1
+	}
+	func Add3() int {
+		return Add3Aux(0)
+	}
+	func Add3Aux(a int) int {
+		return a + 3
+	}
+	func Add3Aux2(b int) int {
+		return b + 3
+	}
+	func Add4() int {
+		return 4
+	}`
+
+	_, di, err := CompileWithOptions("foo.go", strings.NewReader(src), nil)
+	require.NoError(t, err)
+
+	m, err := di.ConvertToManifest(&Options{Overloads: map[string]string{"add3Aux": "add3"}})
+	require.NoError(t, err)
+	require.NoError(t, m.ABI.IsValid())
+	require.NotNil(t, m.ABI.GetMethod("add3", 0))
+	require.NotNil(t, m.ABI.GetMethod("add3", 1))
+	require.Nil(t, m.ABI.GetMethod("add3Aux", 1))
+
+	t.Run("missing method", func(t *testing.T) {
+		_, err := di.ConvertToManifest(&Options{Overloads: map[string]string{"miss": "add3"}})
+		require.Error(t, err)
+	})
+	t.Run("parameter conflict", func(t *testing.T) {
+		_, err := di.ConvertToManifest(&Options{Overloads: map[string]string{"add4": "add3"}})
+		require.Error(t, err)
+	})
+	t.Run("parameter conflict, overload", func(t *testing.T) {
+		_, err := di.ConvertToManifest(&Options{Overloads: map[string]string{
+			"add3Aux":  "add3",
+			"add3Aux2": "add3",
+		}})
+		require.Error(t, err)
+	})
+	t.Run("missing target method", func(t *testing.T) {
+		_, err := di.ConvertToManifest(&Options{Overloads: map[string]string{"add4": "add5"}})
+		require.Error(t, err)
+	})
+}
+
+func TestCompile_SeqPoints_BlankIdentifier(t *testing.T) {
+	src := `package foo
+		func MyFunc() int {
+			return 42
+		}
+		func Main() {
+			var _ = MyFunc()
+		}
+	`
+	_, di, err := CompileWithOptions("foo.go", strings.NewReader(src), nil)
+	require.NoError(t, err)
+
+	expectedSeqPoints := map[string][]DebugSeqPoint{
+		"MyFunc": {
+			{Opcode: 0, StartLine: 3, StartCol: 11, EndLine: 3, EndCol: 13},
+			{Opcode: 2, StartLine: 3, StartCol: 4, EndLine: 3, EndCol: 10},
+		},
+		"Main": {
+			{Opcode: 3, StartLine: 6, StartCol: 12, EndLine: 6, EndCol: 20},
+			{Opcode: 5, StartLine: 6, StartCol: 8, EndLine: 6, EndCol: 12},
+		},
+	}
+
+	for _, m := range di.Methods {
+		expected, ok := expectedSeqPoints[m.ID]
+		require.True(t, ok)
+		require.Equal(t, expected, m.SeqPoints)
+	}
+}

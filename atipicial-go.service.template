@@ -1,0 +1,18 @@
+[Unit]
+Description=Atipicial Go node
+Requires=network.target
+
+[Service]
+Type=notify
+ExecStart=BINDIR/atipicial-go node --mainnet --config-path=SYSCONFIGDIR/atipicial-go
+User=atipicial-go
+Group=atipicial-go
+Restart=always
+RestartSec=5
+StandardError=syslog
+SyslogIdentifier=atipicial-go
+PrivateTmp=true
+WorkingDirectory=UNITWORKDIR
+
+[Install]
+WantedBy=multi-user.target

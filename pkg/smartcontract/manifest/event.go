@@ -1,0 +1,99 @@
+package manifest
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/atipicial/atipicial-go/pkg/smartcontract"
+	"github.com/atipicial/atipicial-go/pkg/vm/stackitem"
+)
+
+// Event is a description of a single event.
+type Event struct {
+	Name       string      `json:"name"`
+	Parameters []Parameter `json:"parameters"`
+}
+
+// Ensure required interface are implemented for proper RPC bindings generation.
+var _ = smartcontract.Convertible(&Event{})
+
+// IsValid checks Event consistency and correctness.
+func (e *Event) IsValid() error {
+	if e.Name == "" {
+		return errors.New("empty or absent name")
+	}
+	return Parameters(e.Parameters).AreValid()
+}
+
+// ToStackItem converts Event to stackitem.Item.
+func (e *Event) ToStackItem() stackitem.Item {
+	params := make([]stackitem.Item, len(e.Parameters))
+	for i := range e.Parameters {
+		params[i] = e.Parameters[i].ToStackItem()
+	}
+	return stackitem.NewStruct([]stackitem.Item{
+		stackitem.Make(e.Name),
+		stackitem.Make(params),
+	})
+}
+
+// FromStackItem converts stackitem.Item to Event.
+func (e *Event) FromStackItem(item stackitem.Item) error {
+	var err error
+	if item.Type() != stackitem.StructT {
+		return errors.New("invalid Event stackitem type")
+	}
+	event := item.Value().([]stackitem.Item)
+	if len(event) != 2 {
+		return errors.New("invalid Event stackitem length")
+	}
+	e.Name, err = stackitem.ToString(event[0])
+	if err != nil {
+		return err
+	}
+	if event[1].Type() != stackitem.ArrayT {
+		return errors.New("invalid Params stackitem type")
+	}
+	params := event[1].Value().([]stackitem.Item)
+	e.Parameters = make([]Parameter, len(params))
+	for i := range params {
+		p := new(Parameter)
+		if err := p.FromStackItem(params[i]); err != nil {
+			return err
+		}
+		e.Parameters[i] = *p
+	}
+	return nil
+}
+
+// CheckCompliance checks compliance of the given array of items with the
+// current event.
+func (e *Event) CheckCompliance(items []stackitem.Item) error {
+	if len(items) != len(e.Parameters) {
+		return fmt.Errorf("mismatch between the number of parameters and items: %d vs %d", len(e.Parameters), len(items))
+	}
+	for i := range items {
+		if !e.Parameters[i].Type.Match(items[i]) {
+			return fmt.Errorf("parameter %d type mismatch: %s (manifest) vs %s (notification)", i, e.Parameters[i].Type.String(), items[i].Type().String())
+		}
+	}
+	return nil
+}
+
+// ToSCParameter creates [smartcontract.Parameter] representing [Event]. It
+// never returns an error. It implements [smartcontract.Convertible]
+// interface.
+func (e *Event) ToSCParameter() (smartcontract.Parameter, error) {
+	params := make([]smartcontract.Parameter, len(e.Parameters))
+	for i := range e.Parameters {
+		prm, err := e.Parameters[i].ToSCParameter()
+		if err != nil {
+			return smartcontract.Parameter{}, err
+		}
+		params[i] = prm
+	}
+	return smartcontract.Parameter{Type: smartcontract.ArrayType, Value: []smartcontract.Parameter{
+		{Type: smartcontract.StringType, Value: e.Name},
+		{Type: smartcontract.ArrayType, Value: params},
+	}}, nil
+}

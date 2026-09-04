@@ -1,0 +1,12 @@
+name: "Iterator example"
+sourceurl: https://github.com/atipicial/atipicial-go/
+supportedstandards: ["AEP-29"]
+events:
+  - name: Key-Value
+    parameters:
+      - name: value
+        type: Any
+  - name: Value
+    parameters:
+      - name: value
+        type: Any

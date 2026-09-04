@@ -1,0 +1,4 @@
+[submodule "pkg/vm/testdata/atipicial-vm"]
+	path = pkg/vm/testdata/atipicial-vm
+	url = https://github.com/atipicial-project/atipicial-vm.git
+	branch = master

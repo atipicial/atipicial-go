@@ -1,0 +1,163 @@
+package server_test
+
+import (
+	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+
+	"github.com/atipicial/atipicial-go/internal/testcli"
+	"github.com/atipicial/atipicial-go/pkg/config"
+	"github.com/atipicial/atipicial-go/pkg/core/storage/dbconfig"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
+)
+
+// generated via `go run ./scripts/gendump/main.go --out ./cli/server/testdata/chain50x2.acc --blocks 50 --txs 2`.
+const inDump = "./testdata/chain50x2.acc"
+
+func TestDBRestoreDump(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	loadConfig := func(t *testing.T) config.Config {
+		chainPath := filepath.Join(tmpDir, "atipicialgotestchain")
+		cfg, err := config.LoadFile(filepath.Join("..", "..", "config", "protocol.unit_testnet.yml"))
+		require.NoError(t, err, "could not load config")
+		cfg.ApplicationConfiguration.DBConfiguration.Type = dbconfig.LevelDB
+		cfg.ApplicationConfiguration.DBConfiguration.LevelDBOptions.DataDirectoryPath = chainPath
+		return cfg
+	}
+
+	cfg := loadConfig(t)
+	out, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+
+	cfgPath := filepath.Join(tmpDir, "protocol.unit_testnet.yml")
+	require.NoError(t, os.WriteFile(cfgPath, out, os.ModePerm))
+
+	e := testcli.NewExecutor(t, false)
+
+	stateDump := filepath.Join(tmpDir, "atipicialgo.teststate")
+	baseArgs := []string{"atipicial-go", "db", "restore", "--unittest",
+		"--config-path", tmpDir, "--in", inDump, "--dump", stateDump}
+
+	t.Run("excessive restore parameters", func(t *testing.T) {
+		e.RunWithError(t, append(baseArgs, "something")...)
+	})
+	// First 15 blocks.
+	e.Run(t, append(baseArgs, "--count", "15")...)
+
+	// Big count.
+	e.RunWithError(t, append(baseArgs, "--count", "1000")...)
+
+	// Continue 15..25
+	e.Run(t, append(baseArgs, "--count", "10")...)
+
+	// Continue till end.
+	e.Run(t, baseArgs...)
+
+	// Dump and compare.
+	dumpPath := filepath.Join(tmpDir, "testdump.acc")
+	incDumpPath := filepath.Join(tmpDir, "testincdump.acc")
+
+	t.Run("missing config", func(t *testing.T) {
+		e.RunWithError(t, "atipicial-go", "db", "dump", "--privnet",
+			"--config-path", tmpDir, "--out", dumpPath)
+	})
+	t.Run("bad logger config", func(t *testing.T) {
+		badConfigDir := t.TempDir()
+		logfile := filepath.Join(badConfigDir, "logdir")
+		require.NoError(t, os.WriteFile(logfile, []byte{1, 2, 3}, os.ModePerm))
+		cfg = loadConfig(t)
+		cfg.ApplicationConfiguration.LogPath = filepath.Join(logfile, "file.log")
+		out, err = yaml.Marshal(cfg)
+		require.NoError(t, err)
+
+		cfgPath = filepath.Join(badConfigDir, "protocol.unit_testnet.yml")
+		require.NoError(t, os.WriteFile(cfgPath, out, os.ModePerm))
+
+		e.RunWithError(t, "atipicial-go", "db", "dump", "--unittest",
+			"--config-path", badConfigDir, "--out", dumpPath)
+	})
+	t.Run("bad storage config", func(t *testing.T) {
+		badConfigDir := t.TempDir()
+		logfile := filepath.Join(badConfigDir, "logdir")
+		require.NoError(t, os.WriteFile(logfile, []byte{1, 2, 3}, os.ModePerm))
+		cfg = loadConfig(t)
+		cfg.ApplicationConfiguration.DBConfiguration.Type = ""
+		out, err = yaml.Marshal(cfg)
+		require.NoError(t, err)
+
+		cfgPath = filepath.Join(badConfigDir, "protocol.unit_testnet.yml")
+		require.NoError(t, os.WriteFile(cfgPath, out, os.ModePerm))
+
+		e.RunWithError(t, "atipicial-go", "db", "dump", "--unittest",
+			"--config-path", badConfigDir, "--out", dumpPath)
+	})
+
+	baseCmd := []string{"atipicial-go", "db", "dump", "--unittest",
+		"--config-path", tmpDir, "--out", dumpPath}
+
+	t.Run("invalid start/count", func(t *testing.T) {
+		e.RunWithError(t, append(baseCmd, "--start", "5", "--count", strconv.Itoa(50-5+1+1))...)
+	})
+	t.Run("excessive dump parameters", func(t *testing.T) {
+		e.RunWithError(t, append(baseCmd, "something")...)
+	})
+
+	e.Run(t, append(baseCmd, "--non-incremental", "--out", dumpPath)...)
+	e.Run(t, append(baseCmd, "--out", incDumpPath)...)
+
+	d1, err := os.ReadFile(inDump)
+	require.NoError(t, err)
+	d2, err := os.ReadFile(dumpPath)
+	require.NoError(t, err)
+	require.Equal(t, d1, d2, "dumps differ")
+	d3, err := os.ReadFile(incDumpPath)
+	require.NoError(t, err)
+	require.Equal(t, append([]byte{0, 0, 0, 0}, d1...), d3, "dumps differ")
+}
+
+func TestDBDumpRestoreIncremental(t *testing.T) {
+	tmpDir := t.TempDir()
+	chainPath := filepath.Join(tmpDir, "atipicialgotestchain")
+	nonincDump := filepath.Join(tmpDir, "nonincDump.acc")
+	incDump := filepath.Join(tmpDir, "incDump.acc")
+
+	cfg, err := config.LoadFile(filepath.Join("..", "..", "config", "protocol.unit_testnet.yml"))
+	require.NoError(t, err, "could not load config")
+	cfg.ApplicationConfiguration.DBConfiguration.Type = dbconfig.LevelDB
+	cfg.ApplicationConfiguration.DBConfiguration.LevelDBOptions.DataDirectoryPath = chainPath
+	out, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+
+	cfgPath := filepath.Join(tmpDir, "protocol.unit_testnet.yml")
+	require.NoError(t, os.WriteFile(cfgPath, out, os.ModePerm))
+
+	e := testcli.NewExecutor(t, false)
+
+	// Create DB from dump.
+	e.Run(t, "atipicial-go", "db", "restore", "--unittest", "--config-path", tmpDir, "--in", inDump)
+
+	// Create two dumps: non-incremental and incremental.
+	dumpBaseArgs := []string{"atipicial-go", "db", "dump", "--unittest",
+		"--config-path", tmpDir}
+
+	// Dump first 15 blocks to a non-incremental dump.
+	e.Run(t, append(dumpBaseArgs, "--out", nonincDump, "--count", "15")...)
+
+	// Dump second 15 blocks to an incremental dump.
+	e.Run(t, append(dumpBaseArgs, "--out", incDump, "--start", "15", "--count", "15")...)
+
+	// Clean the DB.
+	require.NoError(t, os.RemoveAll(chainPath))
+
+	// Restore chain from two dumps.
+	restoreBaseArgs := []string{"atipicial-go", "db", "restore", "--unittest", "--config-path", tmpDir}
+
+	// Restore first 15 blocks from non-incremental dump.
+	e.Run(t, append(restoreBaseArgs, "--in", nonincDump)...)
+
+	// Restore second 15 blocks from incremental dump.
+	e.Run(t, append(restoreBaseArgs, "--in", incDump, "--count", "15")...)
+}

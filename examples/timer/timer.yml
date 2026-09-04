@@ -1,0 +1,6 @@
+name: "Timer example"
+sourceurl: https://github.com/atipicial/atipicial-go/
+supportedstandards: ["AEP-29"]
+events: []
+permissions:
+  - methods: '*'

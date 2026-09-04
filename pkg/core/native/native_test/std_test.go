@@ -1,0 +1,112 @@
+package native
+
+import (
+	"math/big"
+	"strings"
+	"testing"
+
+	"github.com/atipicial/atipicial-go/pkg/compiler"
+	"github.com/atipicial/atipicial-go/pkg/config"
+	"github.com/atipicial/atipicial-go/pkg/core/native/nativehashes"
+	"github.com/atipicial/atipicial-go/pkg/atipicialtest"
+	"github.com/atipicial/atipicial-go/pkg/atipicialtest/chain"
+	"github.com/atipicial/atipicial-go/pkg/vm/stackitem"
+	"github.com/stretchr/testify/require"
+)
+
+func TestStd_HexEncodeDecodeCompat(t *testing.T) {
+	bc, acc := chain.NewSingleWithCustomConfig(t, func(c *config.Blockchain) {
+		c.Hardforks = map[string]uint32{
+			config.HFFaun.String(): 2,
+		}
+	})
+	e := atipicialtest.NewExecutor(t, bc, acc, acc)
+	p := e.CommitteeInvoker(nativehashes.StdLib)
+
+	expectedBytes := []byte{0x00, 0x01, 0x02, 0x03}
+	expectedString := "00010203"
+
+	p.InvokeFail(t, "method not found: hexEncode/1", "hexEncode", expectedBytes)
+
+	e.AddNewBlock(t)
+
+	p.Invoke(t, expectedString, "hexEncode", expectedBytes)
+	p.Invoke(t, expectedBytes, "hexDecode", expectedString)
+}
+
+func TestStd_HexEncodeDecodeInteropAPI(t *testing.T) {
+	bc, acc := chain.NewSingleWithCustomConfig(t, func(c *config.Blockchain) {
+		c.Hardforks = map[string]uint32{
+			config.HFFaun.String(): 0,
+		}
+	})
+	e := atipicialtest.NewExecutor(t, bc, acc, acc)
+
+	src := `package teststd
+		import (
+			"github.com/atipicial/atipicial-go/pkg/interop/native/std"
+		)
+		func Encode(args []any) string {
+			return std.HexEncode(args[0].([]byte))
+		}
+		func Decode(args []any) []byte {
+			return std.HexDecode(args[0].(string))
+		}`
+
+	ctr := atipicialtest.CompileSource(t, e.Validator.ScriptHash(), strings.NewReader(src), &compiler.Options{
+		Name: "teststd_contract",
+	})
+	e.DeployContract(t, ctr, nil)
+
+	expectedBytes := []byte{0x00, 0x01, 0x02, 0x03}
+	expectedString := "00010203"
+
+	ctrInvoker := e.NewInvoker(ctr.Hash, e.Committee)
+
+	ctrInvoker.Invoke(t, stackitem.Make(expectedString), "encode", []any{expectedBytes})
+	ctrInvoker.Invoke(t, stackitem.Make(expectedBytes), "decode", []any{expectedString})
+}
+
+// Ref. https://github.com/atipicial-project/atipicial/pull/4563.
+func TestStd_Itoa_Culture(t *testing.T) {
+	bc, acc := chain.NewSingle(t)
+	e := atipicialtest.NewExecutor(t, bc, acc, acc)
+	p := e.CommitteeInvoker(nativehashes.StdLib)
+
+	p.Invoke(t, stackitem.NewByteArray([]byte("-1")), "itoa", big.NewInt(-1))
+}
+
+// Data taken from https://github.com/atipicial/atipicial-go/issues/4381.
+func TestStd_JSONDeserializeCompat(t *testing.T) {
+	bc, acc := chain.NewSingleWithCustomConfig(t, func(c *config.Blockchain) {
+		c.Hardforks = map[string]uint32{
+			config.HFBasilisk.String(): 0, // enable explicitly to test post-Basilisk behaviour.
+		}
+	})
+	e := atipicialtest.NewExecutor(t, bc, acc, acc)
+	std := e.CommitteeInvoker(nativehashes.StdLib)
+
+	std.InvokeAndCheck(t, func(t testing.TB, stack []stackitem.Item) {
+		require.Equal(t, "43893649166666670000000000000000000", stack[0].Value().(*big.Int).String())
+	}, "jsonDeserialize", stackitem.Make("4.389364916666667e+34"))
+
+	std.InvokeAndCheck(t, func(t testing.TB, stack []stackitem.Item) {
+		require.Equal(t, "2221811666666666600000", stack[0].Value().(*big.Int).String())
+	}, "jsonDeserialize", stackitem.Make("2.2218116666666666e+21"))
+
+	std.InvokeAndCheck(t, func(t testing.TB, stack []stackitem.Item) {
+		require.Equal(t, "11039175000000000000", stack[0].Value().(*big.Int).String())
+	}, "jsonDeserialize", stackitem.Make("11039175000000000000"))
+
+	std.InvokeAndCheck(t, func(t testing.TB, stack []stackitem.Item) {
+		require.Equal(t, "90719925474099300000000000000000000", stack[0].Value().(*big.Int).String())
+	}, "jsonDeserialize", stackitem.Make("9.07199254740993e+34"))
+
+	std.InvokeAndCheck(t, func(t testing.TB, stack []stackitem.Item) {
+		require.Equal(t, "90071992547409940000000000000000000", stack[0].Value().(*big.Int).String())
+	}, "jsonDeserialize", stackitem.Make("9.007199254740993e+34"))
+
+	std.InvokeAndCheck(t, func(t testing.TB, stack []stackitem.Item) {
+		require.Equal(t, "90071992547409930000000000000000000000000000000000", stack[0].Value().(*big.Int).String())
+	}, "jsonDeserialize", stackitem.Make("9007199254740993e+34"))
+}

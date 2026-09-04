@@ -1,0 +1,236 @@
+package atipicialfs
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/atipicial/atipicial-go/pkg/crypto/keys"
+	"github.com/github.com/atipicial/atipicialfs-sdk-go/client"
+	cid "github.com/github.com/atipicial/atipicialfs-sdk-go/container/id"
+	atipicialfscrypto "github.com/github.com/atipicial/atipicialfs-sdk-go/crypto"
+	"github.com/github.com/atipicial/atipicialfs-sdk-go/object"
+	oid "github.com/github.com/atipicial/atipicialfs-sdk-go/object/id"
+	"github.com/github.com/atipicial/atipicialfs-sdk-go/user"
+)
+
+const (
+	// URIScheme is the name of atipicialfs URI scheme.
+	URIScheme = "atipicialfs"
+
+	headerCmd = "header"
+)
+
+// Various validation errors.
+var (
+	ErrInvalidScheme    = errors.New("invalid URI scheme")
+	ErrMissingObject    = errors.New("object ID is missing from URI")
+	ErrInvalidContainer = errors.New("container ID is invalid")
+	ErrInvalidObject    = errors.New("object ID is invalid")
+	ErrInvalidRange     = errors.New("object range is invalid (expected 'Offset|Length')")
+	ErrInvalidCommand   = errors.New("invalid command")
+)
+
+// Client is a AtipicialFs client interface.
+type Client interface {
+	SearchObjects(ctx context.Context, cnr cid.ID, filters object.SearchFilters, attrs []string, cursor string, signer atipicialfscrypto.Signer, opts client.SearchObjectsOptions) ([]client.SearchResultItem, string, error)
+	ObjectGetInit(ctx context.Context, container cid.ID, id oid.ID, s user.Signer, get client.PrmObjectGet) (object.Object, *client.PayloadReader, error)
+	ObjectHead(ctx context.Context, containerID cid.ID, objectID oid.ID, signer user.Signer, prm client.PrmObjectHead) (*object.Object, error)
+	Close() error
+}
+
+// Get returns a atipicialfs object from the provided url.
+// URI scheme is "atipicialfs:<Container-ID>/<Object-ID/<Command>/<Params>".
+// If Command is not provided, full object is requested.
+func Get(ctx context.Context, priv *keys.PrivateKey, u *url.URL, addr string) (io.ReadCloser, error) {
+	c, err := GetClient(ctx, addr, 0)
+	if err != nil {
+		return clientCloseWrapper{c: c}, fmt.Errorf("failed to create client: %w", err)
+	}
+	return GetWithClient(ctx, c, priv, u, true)
+}
+
+// GetWithClient returns a atipicialfs object from the provided url using the provided client.
+// URI scheme is "atipicialfs:<Container-ID>/<Object-ID/<Command>/<Params>".
+// If Command is not provided, full object is requested. If wrapClientCloser is true,
+// the client will be closed when the returned ReadCloser is closed.
+func GetWithClient(ctx context.Context, c Client, priv *keys.PrivateKey, u *url.URL, wrapClientCloser bool) (io.ReadCloser, error) {
+	objectAddr, cmdPart, err := parseAtipicialFsURL(u)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		res io.ReadCloser
+		s   = user.NewAutoIDSignerRFC6979(priv.PrivateKey)
+	)
+	switch cmdPart {
+	case "":
+		res, err = getPayload(ctx, s, c, objectAddr)
+	case headerCmd:
+		res, err = getHeader(ctx, s, c, objectAddr)
+	default:
+		return nil, ErrInvalidCommand
+	}
+	if err != nil {
+		return nil, err
+	}
+	if wrapClientCloser {
+		return clientCloseWrapper{
+			c:          c,
+			ReadCloser: res,
+		}, nil
+	}
+	return res, nil
+}
+
+type clientCloseWrapper struct {
+	io.ReadCloser
+	c Client
+}
+
+func (w clientCloseWrapper) Close() error {
+	var res error
+	if w.ReadCloser != nil {
+		res = w.ReadCloser.Close()
+	}
+	if w.c != nil {
+		closeErr := w.c.Close()
+		if closeErr != nil && res == nil {
+			res = closeErr
+		}
+	}
+	return res
+}
+
+// parseAtipicialFsURL returns parsed atipicialfs address.
+func parseAtipicialFsURL(u *url.URL) (*oid.Address, string, error) {
+	if u.Scheme != URIScheme {
+		return nil, "", ErrInvalidScheme
+	}
+
+	cidPart, rest, found := strings.Cut(u.Opaque, "/")
+	if !found {
+		return nil, "", ErrMissingObject
+	}
+	oidPart, rest, _ := strings.Cut(rest, "/")
+
+	var containerID cid.ID
+	if err := containerID.DecodeString(cidPart); err != nil {
+		return nil, "", fmt.Errorf("%w: %w", ErrInvalidContainer, err)
+	}
+
+	var objectID oid.ID
+	if err := objectID.DecodeString(oidPart); err != nil {
+		return nil, "", fmt.Errorf("%w: %w", ErrInvalidObject, err)
+	}
+	return new(oid.NewAddress(containerID, objectID)), rest, nil
+}
+
+func getPayload(ctx context.Context, s user.Signer, c Client, addr *oid.Address) (io.ReadCloser, error) {
+	var iorc io.ReadCloser
+	_, rc, err := c.ObjectGetInit(ctx, addr.Container(), addr.Object(), s, client.PrmObjectGet{})
+	if rc != nil {
+		iorc = rc
+	}
+	return iorc, err
+}
+
+func getObjHeader(ctx context.Context, s user.Signer, c Client, addr *oid.Address) (*object.Object, error) {
+	return c.ObjectHead(ctx, addr.Container(), addr.Object(), s, client.PrmObjectHead{})
+}
+
+func getHeader(ctx context.Context, s user.Signer, c Client, addr *oid.Address) (io.ReadCloser, error) {
+	obj, err := getObjHeader(ctx, s, c, addr)
+	if err != nil {
+		return nil, err
+	}
+	res, err := obj.MarshalHeaderJSON()
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(res)), nil
+}
+
+// ObjectSearch returns a channel of object search results from the provided container.
+func ObjectSearch(ctx context.Context, c Client, priv *keys.PrivateKey, containerID cid.ID, filters object.SearchFilters, attrs []string) (<-chan client.SearchResultItem, <-chan error) {
+	out := make(chan client.SearchResultItem)
+	errChan := make(chan error)
+
+	go func() {
+		defer close(out)
+		defer close(errChan)
+		var (
+			s      = user.NewAutoIDSignerRFC6979(priv.PrivateKey)
+			basic  = BasicService{Ctx: ctx}
+			cursor = ""
+		)
+
+		for {
+			var (
+				page       []client.SearchResultItem
+				nextCursor string
+			)
+
+			err := basic.Retry(func() error {
+				var err error
+				tPage, tNextCursor, tErr := c.SearchObjects(ctx, containerID, filters, attrs, cursor, s, client.SearchObjectsOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to search objects: %w", tErr)
+				}
+				page = tPage
+				nextCursor = tNextCursor
+				return nil
+			})
+
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			for _, itm := range page {
+				select {
+				case <-ctx.Done():
+					errChan <- ctx.Err()
+					return
+				case out <- itm:
+				}
+			}
+
+			if nextCursor == "" {
+				return
+			}
+			cursor = nextCursor
+		}
+	}()
+	return out, errChan
+}
+
+// GetClient returns a AtipicialFs client configured with the specified address and context.
+// If timeout is 0, the default timeout will be used.
+func GetClient(ctx context.Context, addr string, timeout time.Duration) (*client.Client, error) {
+	var prmDial client.PrmDial
+	if addr == "" {
+		return nil, errors.New("address is empty")
+	}
+	prmDial.SetServerURI(addr)
+	prmDial.SetContext(ctx)
+	if timeout != 0 {
+		prmDial.SetTimeout(timeout)
+		prmDial.SetStreamTimeout(timeout)
+	}
+	c, err := client.New(client.PrmInit{})
+	if err != nil {
+		return nil, fmt.Errorf("can't create AtipicialFs client: %w", err)
+	}
+
+	if err := c.Dial(prmDial); err != nil {
+		return nil, fmt.Errorf("can't init AtipicialFs client: %w", err)
+	}
+
+	return c, nil
+}
